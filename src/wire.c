@@ -200,7 +200,19 @@ ssize_t encode_sock( uint8_t * base,
         break;
     }
     default:
-        retval = -1;
+        /* family==0 is treated as the canonical "no address" placeholder
+         * (zero IPv4 sock, 8 bytes). It must encode successfully so that
+         * fields after it (sn_self_mac, sn_bak_str_len, sn_bak_str) stay
+         * aligned. Returning -1 here would stall idx and shift every
+         * following field, breaking the edge-side decode. */
+        f = 0;
+        retval += encode_uint16(base,idx,f);
+        retval += encode_uint16(base,idx,0); /* port=0 */
+        {
+            uint8_t zero4[IPV4_SIZE] = {0};
+            retval += encode_buf(base,idx,zero4,IPV4_SIZE);
+        }
+        break;
     }
 
     return retval;
@@ -345,6 +357,20 @@ size_t encode_REGISTER_SUPER( uint8_t * base,
      * edge actually has a routable GUA. */
     if ( reg->aflags & N2N_AFLAGS_IPV6_SOCKET )
         retval += encode_sock( base, idx, &reg->own_ipv6 );
+    /* ask_backup tail (sn1 lookup hints): desired_sn1_sock + desired_sn1_mac.
+     * Sent only when the edge actually carries a hint, so normal
+     * registrations save 14 bytes on the wire. The decoder is
+     * length-guarded, so tail-less packets and old peers stay fully
+     * backward compatible in both directions. */
+    {
+        static const uint8_t zero_mac[N2N_MAC_SIZE] = {0};
+        if ( reg->desired_sn1_sock.port != 0 ||
+             memcmp( reg->desired_sn1_mac, zero_mac, N2N_MAC_SIZE ) != 0 )
+        {
+            retval += encode_sock( base, idx, &reg->desired_sn1_sock );
+            retval += encode_mac( base, idx, reg->desired_sn1_mac );
+        }
+    }
     return retval;
 }
 
@@ -392,6 +418,21 @@ size_t decode_REGISTER_SUPER( n2n_REGISTER_SUPER_t * reg,
      * truncated/foreign packet is not over-read. */
     if ( (reg->aflags & N2N_AFLAGS_IPV6_SOCKET) && *rem >= sizeof(n2n_sock_t) )
         retval += decode_sock( &reg->own_ipv6, base, rem, idx );
+    /* desired_sn1_sock — ask_backup request. sn2 matches by IP only
+     * (port-agnostic) since sn1 may have changed port. Old edges omit.
+     * NOTE: an encoded sock is only 8 bytes for family 0 / IPv4 (20 for
+     * IPv6); sizeof(n2n_sock_t) is the C struct size (20). Using sizeof()
+     * here skipped the sock on IPv4-only edges (tail = 8 + MAC 6 = 14 < 20)
+     * and shifted the following desired_sn1_mac read onto the sock bytes,
+     * producing a garbage non-zero "MAC" that never matched the brother.
+     * Use the minimum IPv4 wire size so alignment is preserved;
+     * decode_sock reads the real family-dependent length itself. */
+    if ( *rem >= 8 )
+        retval += decode_sock( &reg->desired_sn1_sock, base, rem, idx );
+    /* desired_sn1_mac — optional sn1 identity for exact brother match.
+     * Only read when present; old edges omit it. */
+    if ( *rem >= (ssize_t)N2N_MAC_SIZE )
+        retval += decode_mac( reg->desired_sn1_mac, base, rem, idx );
 
     return retval;
 }
@@ -465,6 +506,16 @@ size_t encode_REGISTER_SUPER_ACK( uint8_t * base,
     /* Append sn_version for supernode version display.
      * Old edges will simply ignore these extra bytes. */
     retval += encode_buf( base, idx, reg->sn_version, 24 );
+    /* sn_bak_str / sn_bak_str_len — sn2 carries sn1's DNS name string. */
+    retval += encode_uint16( base, idx, reg->sn_bak_str_len );
+    if ( reg->sn_bak_str_len > 0 )
+    {
+        retval += encode_buf( base, idx, reg->sn_bak_str, reg->sn_bak_str_len );
+    }
+    /* sn_bak_v6 — sn2 carries sn1's IPv6 socket (if known). */
+    retval += encode_sock( base, idx, &reg->sn_bak_v6 );
+    /* sn1_mac — this SN's own MAC. */
+    retval += encode_mac( base, idx, reg->sn1_mac );
     return retval;
 }
 
@@ -505,6 +556,34 @@ size_t decode_REGISTER_SUPER_ACK( n2n_REGISTER_SUPER_ACK_t * reg,
     if ( *rem >= 24 )
     {
         retval += decode_buf( reg->sn_version, 24, base, rem, idx );
+    }
+    /* sn_bak_str_len + sn_bak_str — sn2 carries the sn1 DNS name.
+     * Older ACKs do not include these fields; skip when *rem < 3. */
+    if ( *rem >= 2 )
+    {
+        retval += decode_uint16( &(reg->sn_bak_str_len), base, rem, idx );
+        if ( reg->sn_bak_str_len > 0 && reg->sn_bak_str_len < N2N_SOCKBUF_SIZE && *rem >= reg->sn_bak_str_len )
+        {
+            retval += decode_buf( reg->sn_bak_str, reg->sn_bak_str_len, base, rem, idx );
+            reg->sn_bak_str[reg->sn_bak_str_len] = '\0';
+        }
+    }
+    /* sn_bak_v6 — sn2 carries sn1's IPv6 socket (if known).
+     * Older ACKs do not include this field. NOTE: sizeof(n2n_sock_t) is the
+     * C struct size (20), but an encoded sock is only 8 bytes for family 0 /
+     * IPv4 (and 20 for IPv6). Using sizeof() here would skip sn_bak_v6 when
+     * a present-but-IPv4/zero sock was encoded, shifting the following
+     * sn1_mac read to the wrong offset (reading zeros). Use the minimum
+     * IPv4 wire size so alignment is preserved; decode_sock reads the real
+     * family-dependent length itself. */
+    if ( *rem >= 8 )
+    {
+        retval += decode_sock( &reg->sn_bak_v6, base, rem, idx );
+    }
+    /* sn1_mac — this SN's own MAC. Older ACKs do not include this field. */
+    if ( *rem >= (ssize_t)N2N_MAC_SIZE )
+    {
+        retval += decode_mac( reg->sn1_mac, base, rem, idx );
     }
 
     return retval;

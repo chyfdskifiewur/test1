@@ -391,8 +391,20 @@ extern char *n2n_sw_version, *n2n_sw_version_full, *n2n_sw_osName, *n2n_sw_build
 #define N2N_EDGE_SN_HOST_SIZE   48
 typedef char n2n_sn_name_t[N2N_EDGE_SN_HOST_SIZE];
 
-#define N2N_EDGE_NUM_SUPERNODES 2
+#define N2N_EDGE_NUM_SUPERNODES 3
 #define N2N_EDGE_SUP_ATTEMPTS   3
+
+#define N2N_AUTH_SIZE           32
+
+#define MAX_BROTHER_SNS         16
+
+typedef struct {
+    n2n_sock_t   sock;         /* current socket of this brother SN (IPv4 or IPv6, whichever arrives first) */
+    n2n_sock_t   sock6;        /* IPv6 socket of this brother SN (optional, family=0 if not seen on v6) */
+    time_t       seen;         /* last registration time (0 = never, not counted in num_brothers) */
+    time_t       seen6;        /* last v6 registration time */
+    n2n_mac_t    mac;          /* MAC of the brother SN (all-zero = invalid) */
+} n2n_brother_entry_t;
 
 #ifndef N2N_PATHNAME_MAXLEN
 #define N2N_PATHNAME_MAXLEN     256
@@ -412,11 +424,26 @@ struct n2n_edge
 
     n2n_sock_t          supernode;
     n2n_sock_t          supernode_alt;
-    n2n_sock_t          sn_backup;      /* other supernode (dual-SN), used for probe/failback */
+    n2n_sock_t          sn_query;       /* fixed query channel (sn2): always asks sn1's newest address here */
+    uint8_t             sn_query_index; /* index into sn_ip_array of the query channel (sn2) */
+    uint8_t             sn_backup_index; /* index into sn_ip_array of the failover target */
+    n2n_sock_t          sn1_probe_addr; /* last address we probed sn1 at while on the failover target */
+    uint8_t             sn_probe_cookie[N2N_COOKIE_SIZE]; /* shared cookie for both Phase-3 failback probes
+                                                              (direct sn1 probe + sn2 address query); independent
+                                                              of last_cookie so the Phase-4 rotation in the same
+                                                              tick cannot invalidate their ACKs. Generated once
+                                                              per tick; the ACK path tells the two probes apart
+                                                              by sender (sn_query vs sn1_probe_addr). */
+    uint8_t             sn_probe_cookie_valid;
+    uint8_t             sn1_ever_ok;    /*=1 once sn1 accepts a registration / answers us;
+                                          gate: only ask sn2 for sn1's NEW address after this,
+                                          otherwise sn1 never worked and we switch directly */
 
     size_t              sn_idx;
     size_t              sn_num;
     n2n_sn_name_t       sn_ip_array[N2N_EDGE_NUM_SUPERNODES];
+    n2n_auth_t          sn_tokens[N2N_EDGE_NUM_SUPERNODES];
+    int                 token_configured;
     int                 sn_af;
     int                 sn_wait;
 
@@ -467,6 +494,12 @@ struct n2n_edge
     time_t              last_p2p;
     time_t              last_sup;
     size_t              sup_attempts;
+    uint8_t             sn_all_failed;
+    uint8_t             sn_ask_backup;
+    char                sn1_current_addr[N2N_SOCKBUF_SIZE]; /* Authoritative sn1 address (DNS preferred). */
+    n2n_mac_t           sn1_mac;        /* MAC of the SN the edge is currently registered with. */
+    n2n_sock_t          sn1_v6;         /* sn1's IPv6 address (as reported by sn1 in the ACK). */
+    uint8_t             sn_ack_backup[N2N_EDGE_NUM_SUPERNODES]; /* indices whose entry came from the sn1 ACK (backup). */
     uint8_t             sn_relay_fails;   /* consecutive relay send failures, reset on success */
     n2n_cookie_t        last_cookie;
     uint8_t             sn_ack_count;

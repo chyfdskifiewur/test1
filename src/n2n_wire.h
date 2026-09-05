@@ -167,6 +167,10 @@ typedef struct n2n_PACKET n2n_PACKET_t;
 /* Linked with n2n_register_super in n2n_pc_t. Only from edge to supernode. */
 #define N2N_AFLAGS_LOCAL_SOCKET   0x0001  /* local_sock field is valid */
 #define N2N_AFLAGS_FORCE_PEER_INFO 0x0008  /* force supernode to push all peer info */
+#define N2N_AFLAGS_QUERY_ONLY     0x0010  /* REGISTER_SUPER is a one-shot query
+                                             (e.g. ask sn2 for sn1's current address):
+                                             supernode replies with an ACK but does
+                                             NOT register/persist this edge as a peer */
 
 struct n2n_REGISTER_SUPER
 {
@@ -178,6 +182,18 @@ struct n2n_REGISTER_SUPER
     n2n_sock_t          local_sock;     /* LAN address for same-NAT direct connect */
     n2n_sock_t          own_ipv6;       /* global IPv6 (GUA) reported by the edge, valid
                                            only when N2N_AFLAGS_IPV6_SOCKET set */
+
+    /* desired_sn1_sock: when set (family != 0), the edge is in ask_backup
+     * mode and asks this sn2 to look up its brother with the matching
+     * IP/port and return both the current resolved address and that
+     * brother's MAC. Old supernodes ignore the trailing bytes. */
+    n2n_sock_t          desired_sn1_sock;
+
+    /* desired_sn1_mac: the sn1 MAC the edge already learned (from sn2 via a
+     * previous ask_backup). When non-zero, sn2 matches brothers by MAC for
+     * an exact identity match, avoiding ambiguity when several brothers
+     * share an IP. Old supernodes and edges ignore trailing bytes. */
+    n2n_mac_t           desired_sn1_mac;
 };
 
 typedef struct n2n_REGISTER_SUPER n2n_REGISTER_SUPER_t;
@@ -203,6 +219,20 @@ struct n2n_REGISTER_SUPER_ACK
      * Old edges ignore extra bytes; old supernodes leave sn_caps=0 (unknown). */
     uint8_t             sn_caps;        /* N2N_SN_CAPS_* bitmask: supernode IP capability */
     char                sn_version[24]; /* Supernode version string (e.g., "2.3_6.3_r239_483723e") */
+
+    /* sn_bak_str / sn_bak_str_len carry the sn1 backup address as a DNS
+     * name so the edge can re-resolve after sn1's IP changes. */
+    uint16_t            sn_bak_str_len; /* valid bytes in sn_bak_str (0 = none) */
+    char                sn_bak_str[N2N_SOCKBUF_SIZE];
+
+    /* sn_bak_v6 carries sn1's IPv6 socket when sn2 has one.
+     * Old SNs leave it zero; old edges ignore trailing fields. */
+    n2n_sock_t          sn_bak_v6;
+
+    /* sn1_mac: when set (sn2 is the answering supernode and the edge
+     * asked for sn1's MAC), this carries the sn1 brother's NIC MAC.
+     * Old edges ignore trailing fields. */
+    n2n_mac_t           sn1_mac;
 };
 
 typedef struct n2n_REGISTER_SUPER_ACK n2n_REGISTER_SUPER_ACK_t;

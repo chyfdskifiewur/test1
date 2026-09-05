@@ -12,6 +12,40 @@
 #include "n2n_transforms.h"
 #include "n2n_wire.h"
 #include <fcntl.h>
+
+/* forward declarations - needed by run_loop before their definitions */
+struct n2n_sn;
+static int resolve_brother_addr(const char *text, n2n_sock_t *out);
+static void send_brother_reg(struct n2n_sn *sss, time_t now);
+static size_t brother_list_format(struct n2n_sn *sss, char *buf, size_t bufsz);
+
+/* Build an n2n_sock_t from a recvfrom() sockaddr (family 0 if unsupported). */
+static int sock_from_sender( n2n_sock_t *out, const struct sockaddr *sa )
+{
+    memset( out, 0, sizeof(n2n_sock_t) );
+    if ( sa->sa_family == AF_INET )
+    {
+        const struct sockaddr_in *a = (const struct sockaddr_in *)sa;
+        out->family = AF_INET;
+        out->port = ntohs( a->sin_port );
+        memcpy( out->addr.v4, &a->sin_addr, IPV4_SIZE );
+    }
+    else if ( sa->sa_family == AF_INET6 )
+    {
+        const struct sockaddr_in6 *a = (const struct sockaddr_in6 *)sa;
+        out->family = AF_INET6;
+        out->port = ntohs( a->sin6_port );
+        memcpy( out->addr.v6, &a->sin6_addr, IPV6_SIZE );
+    }
+    return out->family;
+}
+
+/* sn_get_device_mac: read the MAC of the first non-loopback, up NIC.
+ * On success returns 1 and fills out_mac. On failure returns 0 and leaves
+ * out_mac zeroed. Implementation depends on platform headers that are
+ * only available after the include block below, so the body is placed
+ * further down. */
+static int sn_get_device_mac(n2n_mac_t out_mac);
 #include <signal.h>
 #include <inttypes.h>
 #ifdef _WIN32
@@ -23,9 +57,82 @@
 #include <sys/select.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netdb.h>
+#include <ifaddrs.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <unistd.h>
+/* <net/if.h> intentionally not included: n2n.h already pulls in
+ * <linux/if.h> on Linux and redefinition of IFF_* / struct ifreq
+ * would break compilation. SIOCGIFHWADDR, struct ifreq and IFNAMSIZ
+ * are therefore already available via n2n.h. */
 #define SOCKET_INVALID -1
 #define CLOSE_SOCKET(s) close(s)
 #endif
+
+/* sn_get_device_mac implementation: depends on platform headers above. */
+static int sn_get_device_mac(n2n_mac_t out_mac)
+{
+    memset(out_mac, 0, sizeof(n2n_mac_t));
+#ifndef _WIN32
+    /* Walk getifaddrs, pick the first interface with any address entry
+     * that is not the loopback interface. The kernel name "lo" (Linux)
+     * is treated as loopback regardless of sa_family — necessary for
+     * musl/uClibc where sa_family may be reported as AF_PACKET or
+     * AF_UNSPEC and IFF_* macros clash between libc <net/if.h> and
+     * kernel <linux/if.h>. */
+    struct ifaddrs *ifap = NULL;
+    if (getifaddrs(&ifap) != 0) return 0;
+    char picked_name[IFNAMSIZ + 1] = {0};
+    struct ifaddrs *ifa;
+    for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_name || !ifa->ifa_addr) continue;
+        if (strcmp(ifa->ifa_name, "lo") == 0) continue;
+        snprintf(picked_name, sizeof(picked_name), "%s", ifa->ifa_name);
+        break;
+    }
+    freeifaddrs(ifap);
+    if (picked_name[0] == '\0') return 0;
+
+    int probe_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (probe_sock < 0) return 0;
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", picked_name);
+    if (ioctl(probe_sock, SIOCGIFHWADDR, &ifr) == 0) {
+        memcpy(out_mac, ifr.ifr_hwaddr.sa_data, sizeof(n2n_mac_t));
+        close(probe_sock);
+        return 1;
+    }
+    close(probe_sock);
+    return 0;
+#else
+    ULONG buflen = 15000;
+    IP_ADAPTER_ADDRESSES *addrs = (IP_ADAPTER_ADDRESSES *)malloc(buflen);
+    if (!addrs) return 0;
+    ULONG rc = GetAdaptersAddresses(AF_UNSPEC, 0, NULL, addrs, &buflen);
+    if (rc == ERROR_BUFFER_OVERFLOW) {
+        free(addrs);
+        buflen = 15000;
+        addrs = (IP_ADAPTER_ADDRESSES *)malloc(buflen);
+        if (!addrs) return 0;
+        rc = GetAdaptersAddresses(AF_UNSPEC, 0, NULL, addrs, &buflen);
+    }
+    if (rc != NO_ERROR) { free(addrs); return 0; }
+    IP_ADAPTER_ADDRESSES *a;
+    int ok = 0;
+    for (a = addrs; a && !ok; a = a->Next) {
+        if (a->OperStatus != IfOperStatusUp) continue;
+        if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+        if (a->PhysicalAddressLength == sizeof(n2n_mac_t)) {
+            memcpy(out_mac, a->PhysicalAddress, sizeof(n2n_mac_t));
+            ok = 1;
+        }
+    }
+    free(addrs);
+    return ok;
+#endif
+}
 
 #define N2N_SN_LPORT_DEFAULT SUPERNODE_PORT
 #define N2N_SN_MGMT_PORT     5646
@@ -420,6 +527,11 @@ struct n2n_sn
     uint16_t            mgmt_port;      /* Managing UDP ports */
     SOCKET              sock;           /* Main socket for UDP traffic with edges. */
     SOCKET              sock6;
+    n2n_sock_t          my_ipv6;        /* first non-link-local IPv6 GUA on this host (used for brother_reg.own_ipv6) */
+    /* brothers[] - active brother SNs discovered via brother_reg.
+     * Indexed by MAC so multiple sn1 peers can register against this sn2
+     * and each slot holds its own v4/v6 socket + last-seen timestamp. */
+    n2n_brother_entry_t    brothers[MAX_BROTHER_SNS];
     SOCKET              mgmt_sock;      /* management socket. */
     SOCKET              ws_listen_sock; /* TCP listen socket for WebSocket (same as lport). */
 #define N2N_SN_MAX_WS 64
@@ -433,9 +545,32 @@ struct n2n_sn
     char                   stats_config_path[256];
     struct community_stats *comm_stats;
     struct rate_limit_rule *rate_rules;
+    n2n_auth_t             peer_token;     /* token required from edge peers (-E) */
+    int                    peer_token_set;
+    n2n_auth_t             backup_token;   /* token required from brother SNs (-B) */
+    int                    backup_token_set;
+    char                   backup_addr_text[256]; /* sn2 address (sn1 given via -b) */
+    time_t                 last_brother_seen;
+    n2n_mac_t              device_mac;       /* local NIC MAC used as SN identity in brother_reg */
 };
 
 typedef struct n2n_sn n2n_sn_t;
+
+/* Fixed identity MAC used when a NIC MAC cannot be read. This is the single
+ * source of truth shared by both the edge-facing Advertise and the brother
+ * registration, so a SN is uniquely identified by one MAC value everywhere. */
+static const n2n_mac_t sn_fallback_mac = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
+
+/* SN identity MAC: the detected NIC MAC, falling back to the fixed local
+ * identity when no NIC MAC could be read. brother_reg and the ACK
+ * self-advertisement both use this so every path reports the same unique
+ * SN identity. */
+static const uint8_t * sn_identity_mac( const n2n_sn_t * sss )
+{
+    return ( sss->device_mac[0] || sss->device_mac[1] || sss->device_mac[2] ||
+             sss->device_mac[3] || sss->device_mac[4] || sss->device_mac[5] )
+           ? sss->device_mac : sn_fallback_mac;
+}
 
 /* Save stats to text file (every 5 minutes) */
 static void save_community_stats(n2n_sn_t *sss, time_t now)
@@ -653,6 +788,18 @@ static int init_sn( n2n_sn_t * sss )
     transop_cc20_init(   &(sss->transop[N2N_TRANSOP_CC20_IDX]) );
     transop_speck_init( &(sss->transop[N2N_TRANSOP_SPECK_IDX]) );
 
+    /* Capture local NIC MAC as the SN's brother_reg identity. Falls back
+     * to all-zero if no NIC can be read; brother_list_store already
+     * rejects entries with a zero MAC so the partner SN will ignore such
+     * registrations. */
+    if (!sn_get_device_mac(sss->device_mac)) {
+        traceEvent(TRACE_WARNING, "Could not detect a NIC MAC; brother_reg will carry a zero MAC.");
+    } else {
+        macstr_t mac_buf;
+        traceEvent(TRACE_NORMAL, "Detected NIC MAC %s",
+                   macaddr_str(mac_buf, sss->device_mac));
+    }
+
     return 0; /* OK */
 }
 
@@ -694,6 +841,50 @@ static void deinit_sn( n2n_sn_t * sss )
 #ifdef _WIN32
     WSACleanup();
 #endif
+}
+
+
+/* brother_list bookkeeping and the helpers that drive it. */
+
+/* brother_list display helper: format brother SN status lines (for -Q / trace). */
+static size_t brother_list_format(n2n_sn_t *sss, char *buf, size_t bufsz)
+{
+    size_t written = 0;
+    int shown = 0;
+    int counter = 0;
+
+    /* Live brother SN: one slot per brother, show v4/v6 on one line. */
+    for (int j = 0; j < MAX_BROTHER_SNS; j++)
+    {
+        n2n_brother_entry_t *b = &sss->brothers[j];
+        uint8_t zero[6] = {0,0,0,0,0,0};
+        if (memcmp(b->mac, zero, 6) == 0) continue;
+        int have_v4 = (b->sock.family != 0 && b->seen != 0);
+        int have_v6 = (b->sock6.family != 0 && b->seen6 != 0);
+        if (!have_v4 && !have_v6) continue;
+
+        if (shown == 0)
+            written += snprintf(buf + written, bufsz - written, "brother*\n");
+        counter++;
+        const uint8_t *mac = b->mac;
+        char v4_part[64] = "-";
+        if (have_v4)
+            sock_to_cstr(v4_part, &b->sock);
+        char v6_part[64] = "-";
+        if (have_v6)
+        {
+            char v6_str[INET6_ADDRSTRLEN];
+            inet_ntop(AF_INET6, b->sock6.addr.v6, v6_str, sizeof(v6_str));
+            snprintf(v6_part, sizeof(v6_part), "[%s]:%u", v6_str, b->sock6.port);
+        }
+        written += snprintf(buf + written, bufsz - written,
+                            "%4d  %02X:%02X:%02X:%02X:%02X:%02X  %s/%s\n",
+                            counter,
+                            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                            v4_part, v6_part);
+        shown++;
+    }
+    return written;
 }
 
 
@@ -922,11 +1113,9 @@ static int update_edge( n2n_sn_t * sss,
                 sock_to_cstr(addr_buf, &scan->sock6);
             else
                 strcpy(addr_buf, "-");
-            traceEvent( TRACE_NORMAL, "update_edge created   %s vip=%s ==> %s%s",
-                        macaddr_str( mac_buf, edgeMac ),
+            traceEvent( TRACE_NORMAL, "update_edge created %s ==> %s",
                         inet_ntoa(vip_addr),
-                        addr_buf,
-                        scan->num_sockets > 1 ? " (LAN)" : "" );
+                        addr_buf );
         }
 
         scan->last_seen = now;
@@ -1365,6 +1554,7 @@ static int process_mgmt( n2n_sn_t * sss,
     size_t ressize = 0;
     ssize_t r;
     struct peer_info *list;
+    n2n_sock_str_t sockbuf;
 #define MAX_COMMUNITIES 256
     n2n_community_t communities[MAX_COMMUNITIES];
     int num_communities = 0;
@@ -1403,6 +1593,8 @@ static int process_mgmt( n2n_sn_t * sss,
 	if (ressize < N2N_SN_PKTBUF_SIZE)
         ressize += snprintf(resbuf + ressize, N2N_SN_PKTBUF_SIZE - ressize,
                            "---v2.3----------------------------------------------------------------------------------------------------\n");
+    /* brother table sits between the two v2.3 separator lines */
+    ressize += brother_list_format(sss, resbuf + ressize, N2N_SN_PKTBUF_SIZE - ressize);
 
     r = sendto(sss->mgmt_sock, resbuf, ressize, 0,
                sender_sock, sender_sock_len);
@@ -1669,6 +1861,9 @@ static int process_mgmt( n2n_sn_t * sss,
                            (unsigned int) sss->stats.fwd,
                            ip_support,
                            n2n_sw_version_full);
+
+    /* brother_list_format output is sent earlier, between the two v2.3
+     * separator lines. */
 
     r = sendto(sss->mgmt_sock, resbuf, ressize, 0,
               sender_sock, sender_sock_len);
@@ -2211,17 +2406,7 @@ static int process_udp( n2n_sn_t * sss,
             /* We are going to add socket even if it was not there before */
             cmn2.flags |= N2N_FLAGS_SOCKET | N2N_FLAGS_FROM_SUPERNODE;
 
-            if (sender_sock->sa_family == AF_INET) {
-                struct sockaddr_in* sock = (struct sockaddr_in*) sender_sock;
-                reg.sock.family = AF_INET;
-                reg.sock.port = ntohs(sock->sin_port);
-                memcpy( reg.sock.addr.v4, &(sock->sin_addr), IPV4_SIZE );
-            } else if (sender_sock->sa_family == AF_INET6) {
-                struct sockaddr_in6* sock = (struct sockaddr_in6*) sender_sock;
-                reg.sock.family = AF_INET6;
-                reg.sock.port = ntohs(sock->sin6_port);
-                memcpy( reg.sock.addr.v6, &(sock->sin6_addr), IPV6_SIZE );
-            }
+            sock_from_sender( &(reg.sock), sender_sock );
 
             rec_buf = encbuf;
 
@@ -2415,6 +2600,104 @@ static int process_udp( n2n_sn_t * sss,
         ++(sss->stats.reg_super);
         decode_REGISTER_SUPER( &reg, &cmn, udp_buf, &rem, &idx );
 
+        /* Brother SN detection: sn1 -> sn2 periodic registration, carries sn1's current address. */
+        int is_brother_reg = (memcmp(cmn.community, "brother_reg", 11) == 0);
+        if (is_brother_reg)
+        {
+            /* Validate backup_token when configured; no -B accepts any
+             * brother SN (auto-pairing via -b alone). */
+            if (sss->backup_token_set &&
+                memcmp(reg.auth.token, sss->backup_token.token, sss->backup_token.toksize) != 0)
+            {
+                traceEvent(TRACE_WARNING, "Brother reg rejected: bad backup token");
+                return 0;
+            }
+
+            /* Find slot by MAC; if not found, fill first empty slot;
+             * if all full, replace the slot whose seen is the oldest. */
+            uint8_t zero[6] = {0,0,0,0,0,0};
+            int slot = -1, oldest_slot = -1;
+            time_t oldest_seen = (time_t)(~(time_t)0);
+            for (int j = 0; j < MAX_BROTHER_SNS; j++) {
+                n2n_brother_entry_t *bb = &sss->brothers[j];
+                int mac_zero = (memcmp(bb->mac, zero, 6) == 0);
+                int mac_match = !mac_zero && (memcmp(bb->mac, reg.edgeMac, 6) == 0);
+                if (mac_match) { slot = j; break; }
+                if (mac_zero && slot < 0) slot = j;
+                time_t bb_seen = bb->seen > bb->seen6 ? bb->seen : bb->seen6;
+                if (bb_seen < oldest_seen) {
+                    oldest_seen = bb_seen;
+                    oldest_slot = j;
+                }
+            }
+            if (slot < 0) slot = (oldest_slot >= 0) ? oldest_slot : 0;
+
+            n2n_brother_entry_t *be = &sss->brothers[slot];
+            memcpy(be->mac, reg.edgeMac, sizeof(n2n_mac_t));
+
+            /* Build n2n_sock_t from sender and assign to matching slot family. */
+            n2n_sock_t sender_n2n;
+            sock_from_sender( &sender_n2n, sender_sock );
+            if ( sender_n2n.family == AF_INET )
+            {
+                be->sock = sender_n2n;
+                be->seen = now;
+            }
+            else if ( sender_n2n.family == AF_INET6 )
+            {
+                be->sock6 = sender_n2n;
+                be->seen6 = now;
+            }
+            sss->last_brother_seen = now;
+
+            /* Refresh IPv6 entry from reg.own_ipv6 whenever sn1 provides one.
+             * The own_ipv6 GUA is what sn1 currently uses for incoming IPv6
+             * traffic, so its port follows sn1's -l value. Update every
+             * brother_reg so a port change on sn1 is reflected here. */
+            if ((reg.aflags & N2N_AFLAGS_IPV6_SOCKET) &&
+                reg.own_ipv6.family == AF_INET6)
+            {
+                be->sock6 = reg.own_ipv6;
+                be->seen6 = now;
+            }
+            traceEvent(TRACE_INFO, "Brother SN registered from %s",
+                       sock_to_cstr(sockbuf, &sender_n2n));
+            return 0; /* brother registration does not need an ACK */
+        }
+
+        /* Edge registration: validate peer_token (if configured).
+         * Brother-trusted source: if the edge arrives from a registered
+         * brother sn1 (recently seen, sender matches its sock), the peer is
+         * admitted without token verification. The edge carries no sn2
+         * token because the user only configured sn1's -T. */
+        if (sss->peer_token_set)
+        {
+            int brother_alive = (sss->last_brother_seen != 0) &&
+                                ((now - sss->last_brother_seen) <= 180);
+            int from_brother = 0;
+            if (brother_alive)
+            {
+                n2n_sock_t sender_n2n;
+                uint8_t zero[6] = {0,0,0,0,0,0};
+                sock_from_sender( &sender_n2n, sender_sock );
+                for (int j = 0; j < MAX_BROTHER_SNS && !from_brother; j++) {
+                    n2n_brother_entry_t *b = &sss->brothers[j];
+                    if (memcmp(b->mac, zero, 6) == 0) continue;
+                    if ((b->sock.family != 0 &&
+                         sock_equal(&sender_n2n, &b->sock) == 0) ||
+                        (b->sock6.family == AF_INET6 &&
+                         sock_equal(&sender_n2n, &b->sock6) == 0))
+                        from_brother = 1;
+                }
+            }
+            if (!from_brother &&
+                memcmp(reg.auth.token, sss->peer_token.token, sss->peer_token.toksize) != 0)
+            {
+                traceEvent(TRACE_WARNING, "Peer reg rejected: bad peer token");
+                return 0;
+            }
+        }
+
         cmn2.ttl = N2N_DEFAULT_TTL;
         cmn2.pc = n2n_register_super_ack;
         cmn2.flags = N2N_FLAGS_SOCKET | N2N_FLAGS_FROM_SUPERNODE;
@@ -2424,25 +2707,105 @@ static int process_udp( n2n_sn_t * sss,
         memcpy( ack.edgeMac, reg.edgeMac, sizeof(n2n_mac_t) );
         ack.lifetime = reg_lifetime( sss );
 
-        if (sender_sock->sa_family == AF_INET) {
-            struct sockaddr_in* sock = (struct sockaddr_in*) sender_sock;
-            ack.sock.family = AF_INET;
-            ack.sock.port = ntohs(sock->sin_port);
-            memcpy( ack.sock.addr.v4, &(sock->sin_addr), IPV4_SIZE );
-        } else if (sender_sock->sa_family == AF_INET6) {
-            struct sockaddr_in6* sock = (struct sockaddr_in6*) sender_sock;
-            ack.sock.family = AF_INET6;
-            ack.sock.port = ntohs(sock->sin6_port);
-            memcpy( ack.sock.addr.v6, &(sock->sin6_addr), IPV6_SIZE );
+        sock_from_sender( &(ack.sock), sender_sock );
+
+        /* Advertise sn2 to it inside the ACK when we know a configured -b string
+         * or have a live brother within 180s. The edge uses sn_bak_str (the
+         * verbatim DNS-style string from sn1's -b argument) so it stays
+         * stable across DNS changes. sn_bak / sn_bak_v6 are kept zero and
+         * ignored on the edge. */
+        if (sss->backup_addr_text[0] != 0)
+        {
+            size_t slen = strlen(sss->backup_addr_text);
+            if (slen >= N2N_SOCKBUF_SIZE) slen = N2N_SOCKBUF_SIZE - 1;
+            ack.num_sn = 1;
+            ack.sn_bak_str_len = (uint16_t)slen;
+            memcpy(ack.sn_bak_str, sss->backup_addr_text, slen);
+            ack.sn_bak_str[slen] = '\0';
         }
 
-        ack.num_sn=0; /* No backup */
-        memset( &(ack.sn_bak), 0, sizeof(n2n_sock_t) );
+        /* ask_backup lookup: if the registering edge supplied desired_sn1_sock
+         * and we have a brother SN whose IP matches (port-agnostic since
+         * the very point of this lookup is sn1 changed its port), return
+         * that brother's current resolved IP and MAC so the edge can
+         * reconnect to sn1 at its new address and track sn1 identity. */
+        uint8_t ask_zero[6] = {0,0,0,0,0,0};
+
+        /* Not an ask_backup probe: a normal edge is registering with us.
+         * Advertise our own SN identity (MAC + global IPv6) — the same
+         * identity brother_reg carries to the brother SN — so a newly
+         * started edge learns sn1's MAC/IPv6 right from its first ACK.
+         * Hint presence is tested by port: a zero-encoded sock decodes as
+         * AF_INET with port 0, so family cannot distinguish "no hint". */
+        if (reg.desired_sn1_sock.port == 0 &&
+            memcmp(reg.desired_sn1_mac, ask_zero, 6) == 0)
+        {
+            const uint8_t *id_mac = sn_identity_mac( sss );
+            memcpy(ack.sn1_mac, id_mac, N2N_MAC_SIZE);
+            /* Report our own global IPv6 so the edge can show a dual-stack
+             * address for this SN (stays family 0 when we have none). */
+            if (sss->my_ipv6.family == AF_INET6)
+                ack.sn_bak_v6 = sss->my_ipv6;
+        }
+
+        /* Match by sn1 MAC first (exact identity, immune to shared/shifted
+         * IP); fall back to IP when the edge has no sn1 MAC yet. */
+        int want_mac = (memcmp(reg.desired_sn1_mac, ask_zero, 6) != 0);
+        /* Hint presence is detected by port (a real sn1 sock always has a
+         * port); a zero-encoded sock decodes as AF_INET with port 0, so
+         * checking family here would fire on every normal registration. */
+        if ((reg.desired_sn1_sock.port != 0 || want_mac) &&
+            sss->last_brother_seen != 0 &&
+            (now - sss->last_brother_seen <= 180))
+        {
+            n2n_sock_t *ds = &reg.desired_sn1_sock;
+            for (int j = 0; j < MAX_BROTHER_SNS; j++) {
+                n2n_brother_entry_t *bb = &sss->brothers[j];
+                if (memcmp(bb->mac, ask_zero, 6) == 0) continue;
+
+                int match = 0;
+                if (want_mac) {
+                    if (memcmp(bb->mac, reg.desired_sn1_mac, N2N_MAC_SIZE) == 0)
+                        match = 1;
+                } else {
+                    if (ds->family == AF_INET && bb->sock.family == AF_INET &&
+                        memcmp(ds->addr.v4, bb->sock.addr.v4, IPV4_SIZE) == 0)
+                        match = 1;
+                    else if (ds->family == AF_INET6 && bb->sock6.family == AF_INET6 &&
+                        memcmp(ds->addr.v6, bb->sock6.addr.v6, IPV6_SIZE) == 0)
+                        match = 1;
+                }
+                if (!match) continue;
+
+                if (bb->sock.family != 0)
+                {
+                    ack.sn_bak = bb->sock;
+                    /* num_sn gates the on-wire encoding of sn_bak in
+                     * REGISTER_SUPER_ACK. Without setting it here the
+                     * matched brother address is filled in memory but
+                     * never sent, and the edge sees an empty answer. */
+                    ack.num_sn = 1;
+                }
+                if (bb->sock6.family == AF_INET6) ack.sn_bak_v6 = bb->sock6;
+                memcpy(ack.sn1_mac, bb->mac, N2N_MAC_SIZE);
+                traceEvent(TRACE_INFO, "ask_backup: sn1 %s MAC %s",
+                           sock_to_cstr(sockbuf, &ack.sn_bak),
+                           macaddr_str(mac_buf, bb->mac));
+                break;
+            }
+        }
 
         /* Fill sn_caps so edge knows this supernode's IP stack capabilities */
         ack.sn_caps = 0;
         if (sss->ipv4_available) ack.sn_caps |= N2N_SN_CAPS_IPV4;
         if (sss->ipv6_available) ack.sn_caps |= N2N_SN_CAPS_IPV6;
+
+        /* sn1's identity reaches the edge from two sources, both derived
+         * from the same device_mac: the self-advertisement above (normal
+         * registrations) and the ask_backup lookup above reporting the
+         * brother record's MAC. The edge adopts them only from genuine sn1
+         * sources (its own ACK while on sn1, or sn_bak-carrying replies), so
+         * a failover target's own identity never overwrites sn1's. */
 
         traceEvent( TRACE_DEBUG, "Rx REGISTER_SUPER for %s %s",
                     macaddr_str( mac_buf, reg.edgeMac ),
@@ -2451,12 +2814,18 @@ static int process_udp( n2n_sn_t * sss,
         uint32_t use_requested_ip = reg.dev_addr.net_addr;
         uint8_t use_request_ip = 1; /* always assign IP (auto-assign if net_addr==0) */
 
+        /* QUERY_ONLY: edge is asking us (as the brother/query channel) for
+         * sn1's current address via a one-shot probe. Answer with the ACK
+         * (including the sn1 brother lookup) but do NOT register/persist
+         * this edge as a peer, so it never shows up in / clogs our table. */
+        int query_only = (reg.aflags & N2N_AFLAGS_QUERY_ONLY) ? 1 : 0;
+
         const n2n_sock_t *local_sock_ptr = (reg.aflags & N2N_AFLAGS_LOCAL_SOCKET) ? &reg.local_sock : NULL;
         uint8_t local_sock_ena = (reg.aflags & N2N_AFLAGS_LOCAL_SOCKET) ? 1 : 0;
         uint8_t force_peer_info = (reg.aflags & N2N_AFLAGS_FORCE_PEER_INFO) ? 1 : 0;
 
         /* Check IP conflict: different MAC, same IP in same community */
-        if (use_request_ip && use_requested_ip != 0) {
+        if (!query_only && use_request_ip && use_requested_ip != 0) {
             struct peer_info *ck = sss->edges;
             while (ck) {
                 if (ck->assigned_ip == use_requested_ip &&
@@ -2492,14 +2861,14 @@ static int process_udp( n2n_sn_t * sss,
             }
         }
 
-        int is_new_edge = update_edge( sss, reg.edgeMac, cmn.community, &(ack.sock),
+        int is_new_edge = query_only ? 0 : update_edge( sss, reg.edgeMac, cmn.community, &(ack.sock),
                      local_sock_ptr, local_sock_ena,
                      ((reg.aflags & N2N_AFLAGS_IPV6_SOCKET) && reg.own_ipv6.family == AF_INET6)
                          ? &reg.own_ipv6 : NULL,
                      now, NULL, NULL, use_request_ip, use_requested_ip );
 
         /* Set assigned IP in ACK */
-        if (use_request_ip) {
+        if (!query_only && use_request_ip) {
             struct peer_info *edge_peer = find_peer_by_mac(sss->edges, reg.edgeMac);
             if (edge_peer && edge_peer->assigned_ip) {
                 ack.dev_addr.net_addr = htonl(edge_peer->assigned_ip);
@@ -2508,7 +2877,7 @@ static int process_udp( n2n_sn_t * sss,
         }
 
         /* If this REGISTER_SUPER arrived via WS, mark the edge as WS-connected (forwarding uses ws_send) */
-        if (ws_sender) {
+        if (!query_only && ws_sender) {
             struct peer_info *edge_peer = find_peer_by_mac(sss->edges, reg.edgeMac);
             if (edge_peer) edge_peer->ws = ws_sender;
         }
@@ -2519,15 +2888,11 @@ static int process_udp( n2n_sn_t * sss,
         encode_REGISTER_SUPER_ACK( ackbuf, &encx, &cmn2, &ack );
 
 
-        /* Reply ACK: WS via ws_send, UDP via sendto */
+        /* Reply ACK: WS via ws_send, UDP via the matching v4/v6 socket */
         if (ws_sender) {
             ws_send(ws_sender, ackbuf, encx);
         } else {
-            SOCKET send_sock = (sender_sock->sa_family == AF_INET6) ? sss->sock6 : sss->sock;
-            socklen_t sock_len = (sender_sock->sa_family == AF_INET6) ?
-                                 sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
-            sendto( send_sock, ackbuf, encx, 0,
-                    (struct sockaddr *)sender_sock, sock_len );
+            sendto_sock( sss, &ack.sock, ackbuf, encx );
         }
 
         traceEvent( TRACE_DEBUG, "Tx REGISTER_SUPER_ACK for %s %s%s",
@@ -2619,13 +2984,16 @@ static void help(int argc, char * const argv[])
     fprintf( stderr, "-l <lport>\tSet UDP main listen port to <lport>.\n" );
     fprintf( stderr, "-L <file> \tTraffic statistics file (config auto-derived as .cfg).\n" );
     fprintf( stderr, "-4|-6     \tIP mode: -4 (IPv4 only), -6 (IPv6 only), both/none (dual-stack).\n" );
+    fprintf( stderr, "-b <host:port>\tBrother supernode address.\n" );
+    fprintf( stderr, "-B <token>\tToken required from brother SNs (no -B = accept any brother).\n" );
+    fprintf( stderr, "-E <token>\tToken required from edges.\n" );
+#if defined(N2N_HAVE_DAEMON)
+    fprintf( stderr, "-f        \tRun in foreground.\n" );
+#endif /* #if defined(N2N_HAVE_DAEMON) */
     fprintf( stderr, "-Q <port> \tQuery management port (for standalone use). (default: %d).\n", N2N_SN_MGMT_PORT );
 #ifndef _WIN32
     fprintf( stderr, "-t <port>\tSet management UDP port to <port> (default: 5646).\n" );
 #endif
-#if defined(N2N_HAVE_DAEMON)
-    fprintf( stderr, "-f        \tRun in foreground.\n" );
-#endif /* #if defined(N2N_HAVE_DAEMON) */
     fprintf( stderr, "-v        \tIncrease verbosity. Can be used multiple times.\n" );
     fprintf( stderr, "-h        \tThis help message.\n" );
     fprintf( stderr, "\n" );
@@ -2700,7 +3068,7 @@ int main( int argc, char * const argv[] )
     {
         int opt;
 
-        while((opt = getopt_long(argc, argv, "ft:l:L:46vh", long_options, NULL)) != -1)
+        while((opt = getopt_long(argc, argv, "ft:l:L:46vhE:B:b:", long_options, NULL)) != -1)
         {
             switch (opt)
             {
@@ -2727,6 +3095,26 @@ int main( int argc, char * const argv[] )
 								exit(-1);
 						}
 #endif
+                break;
+            case 'E': /* peer-token (token required from edge peers) */
+                sss.peer_token.scheme = 0; /* scheme=0: plaintext memcmp */
+                sss.peer_token.toksize = (uint16_t)strlen(optarg);
+                if (sss.peer_token.toksize > N2N_AUTH_TOKEN_SIZE)
+                    sss.peer_token.toksize = N2N_AUTH_TOKEN_SIZE;
+                memcpy(sss.peer_token.token, optarg, sss.peer_token.toksize);
+                sss.peer_token_set = 1;
+                break;
+            case 'B': /* backup-token (token required from brother SNs) */
+                sss.backup_token.scheme = 0;
+                sss.backup_token.toksize = (uint16_t)strlen(optarg);
+                if (sss.backup_token.toksize > N2N_AUTH_TOKEN_SIZE)
+                    sss.backup_token.toksize = N2N_AUTH_TOKEN_SIZE;
+                memcpy(sss.backup_token.token, optarg, sss.backup_token.toksize);
+                sss.backup_token_set = 1;
+                break;
+            case 'b': /* peer (brother) supernode address (sn1 -> sn2 brother_reg) */
+                strncpy(sss.backup_addr_text, optarg, sizeof(sss.backup_addr_text)-1);
+                sss.backup_addr_text[sizeof(sss.backup_addr_text)-1] = '\0';
                 break;
             case 'f': /* foreground */
                 sss.daemon = 0;
@@ -2793,6 +3181,9 @@ int main( int argc, char * const argv[] )
                     if (!IN6_IS_ADDR_LOOPBACK(&s6->sin6_addr) &&
                         !IN6_IS_ADDR_LINKLOCAL(&s6->sin6_addr)) {
                         ipv6_available = 1;
+                        sss.my_ipv6.family = AF_INET6;
+                        sss.my_ipv6.port = sss.lport;
+                        memcpy(sss.my_ipv6.addr.v6, &s6->sin6_addr, IPV6_SIZE);
                         break;
                     }
                 }
@@ -2812,6 +3203,9 @@ int main( int argc, char * const argv[] )
                             !IN6_IS_ADDR_LOOPBACK(&s6->sin6_addr) &&
                             !IN6_IS_ADDR_LINKLOCAL(&s6->sin6_addr)) {
                             ipv6_available = 1;
+                            sss.my_ipv6.family = AF_INET6;
+                            sss.my_ipv6.port = sss.lport;
+                            memcpy(sss.my_ipv6.addr.v6, &s6->sin6_addr, IPV6_SIZE);
                             break;
                         }
                     }
@@ -3090,10 +3484,161 @@ static int run_loop( n2n_sn_t * sss )
             purge_expired_community_stats(sss, &last_stats_purge, now);
             save_community_stats(sss, now);
         }
+
+        /* sn1 -> sn2 brother_reg, every 60s. */
+        if (sss->backup_addr_text[0])
+        {
+            static time_t last_brother_reg = 0;
+            if (now - last_brother_reg >= 60)
+            {
+                last_brother_reg = now;
+                send_brother_reg(sss, now);
+            }
+        }
+
+        /* Drop brother entries that have not checked in for 5 minutes. */
+        {
+            static time_t last_brother_purge = 0;
+            if (now - last_brother_purge >= 30)
+            {
+                last_brother_purge = now;
+                uint8_t zero[6] = {0,0,0,0,0,0};
+                for (int j = 0; j < MAX_BROTHER_SNS; j++) {
+                    n2n_brother_entry_t *bb = &sss->brothers[j];
+                    if (memcmp(bb->mac, zero, 6) == 0) continue;
+                    time_t last = bb->seen > bb->seen6 ? bb->seen : bb->seen6;
+                    if (last != 0 && (now - last) > 300) {
+                        traceEvent(TRACE_NORMAL, "Brother purge: %02X:%02X:%02X:%02X:%02X:%02X idle %lus",
+                                   bb->mac[0], bb->mac[1], bb->mac[2],
+                                   bb->mac[3], bb->mac[4], bb->mac[5],
+                                   (unsigned long)(now - last));
+                        memset(bb, 0, sizeof(n2n_brother_entry_t));
+                    }
+                }
+            }
+        }
     }
 
     deinit_sn( sss );
     free_community_stats( &sss->comm_stats );
     free_rate_limit_rules( &sss->rate_rules );
+    return 0;
+}
+
+/* send_brother_reg: sn1 -> sn2 brother registration, sent every 60s.
+ * Uses the local NIC MAC as the SN identifier (matches what edge sees when
+ * the SN forwards traffic) and the community string "brother_reg" (11
+ * bytes, no trailing NUL) so sn2 can detect that the packet is a brother
+ * update rather than a normal edge register. */
+static void send_brother_reg(n2n_sn_t *sss, time_t now)
+{
+    n2n_sock_t              backup_sock;
+    n2n_common_t            cmn;
+    n2n_REGISTER_SUPER_t    reg;
+    uint8_t                 pktbuf[N2N_SN_PKTBUF_SIZE];
+    size_t                  idx = 0;
+    n2n_sock_str_t          sockbuf;
+
+    if (sss->backup_addr_text[0] == '\0') return;
+
+    /* Resolve and cache the sn2 address inside this process. */
+    static n2n_sock_t  cached_sock = {0};
+    static int        cached_resolved = 0;
+    static time_t     cached_time = 0;
+
+    if (!cached_resolved || (now - cached_time > 300)) {
+        cached_resolved = 0;
+        memset(&cached_sock, 0, sizeof(cached_sock));
+        if (resolve_brother_addr(sss->backup_addr_text, &cached_sock) == 0) {
+            cached_resolved = 1;
+            cached_time = now;
+        }
+    }
+    if (!cached_resolved) return;
+    backup_sock = cached_sock;
+
+    /* Prefer the live NIC MAC. Skip registration entirely if neither NIC
+     * MAC nor fallback is available so the partner SN never sees a
+     * zero-MAC entry. */
+    const uint8_t *id_mac = sn_identity_mac( sss );
+
+    memset(&cmn, 0, sizeof(cmn));
+    memset(&reg, 0, sizeof(reg));
+    cmn.ttl = N2N_DEFAULT_TTL;
+    cmn.pc = n2n_register_super;
+    cmn.flags = N2N_FLAGS_SOCKET;
+    memcpy(cmn.community, "brother_reg", 11); /* brother-only community tag */
+
+    /* Cookie = id_mac; edgeMac = id_mac. */
+    memcpy(reg.cookie, id_mac, N2N_COOKIE_SIZE);
+    memcpy(reg.edgeMac, id_mac, sizeof(reg.edgeMac));
+    /* Carry our IPv6 GUA (if any) so a v4-only sn2 still learns how to reach us on IPv6. */
+    if (sss->my_ipv6.family == AF_INET6) {
+        reg.aflags |= N2N_AFLAGS_IPV6_SOCKET;
+        reg.own_ipv6 = sss->my_ipv6;
+    }
+    /* Carry backup_token when configured. */
+    if (sss->backup_token_set) {
+        memcpy(reg.auth.token, sss->backup_token.token, sss->backup_token.toksize);
+        reg.auth.toksize = sss->backup_token.toksize;
+    }
+
+    encode_REGISTER_SUPER(pktbuf, &idx, &cmn, &reg);
+
+    /* Send to sn2 over the address family the resolver returned. */
+    sendto_sock( sss, &backup_sock, pktbuf, idx );
+
+    traceEvent(TRACE_DEBUG, "Sent brother_reg to %s as %02x:%02x:%02x:%02x:%02x:%02x",
+               sock_to_cstr(sockbuf, &backup_sock),
+               id_mac[0], id_mac[1], id_mac[2], id_mac[3], id_mac[4], id_mac[5]);
+}
+
+/* resolve_brother_addr: parse "host:port" into an n2n_sock_t.
+ * getaddrinfo handles IPv4/IPv6 literals and DNS names; prefer IPv4. */
+static int resolve_brother_addr(const char *text, n2n_sock_t *out)
+{
+    char host[256];
+    const char *colon;
+    uint16_t port;
+    struct addrinfo hints, *res = NULL, *p = NULL;
+
+    if (!text || !out) return -1;
+    colon = strrchr(text, ':');
+    if (!colon) return -1;
+    size_t hlen = colon - text;
+    if (hlen >= sizeof(host)) return -1;
+    memcpy(host, text, hlen);
+    host[hlen] = '\0';
+    port = (uint16_t)atoi(colon + 1);
+    if (port == 0) return -1;
+
+    /* Strip optional IPv6 brackets. */
+    if (host[0] == '[' && host[hlen-1] == ']')
+    {
+        host[hlen-1] = '\0';
+        memmove(host, host + 1, hlen - 1);
+    }
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) return -1;
+
+    for (p = res; p; p = p->ai_next) if (p->ai_family == AF_INET) break;
+    if (!p) for (p = res; p; p = p->ai_next) if (p->ai_family == AF_INET6) break;
+    if (!p) { freeaddrinfo(res); return -1; }
+
+    if (p->ai_family == AF_INET)
+    {
+        out->family = AF_INET;
+        memcpy(out->addr.v4, &((struct sockaddr_in*)p->ai_addr)->sin_addr, IPV4_SIZE);
+    }
+    else
+    {
+        out->family = AF_INET6;
+        memcpy(out->addr.v6, &((struct sockaddr_in6*)p->ai_addr)->sin6_addr, IPV6_SIZE);
+    }
+    out->port = port;
+    freeaddrinfo(res);
     return 0;
 }
