@@ -220,12 +220,12 @@ def update_txt(token, domain, sub_domain, value, ttl=60):
     if not record_id:
         # Create new record
         result = dnspod_call(token, 'Record.Create',
-                             f"domain={domain}&sub_domain={sub_domain}&record_type=TXT&value={value}&record_line=默认&ttl={ttl}")
+                             f"domain={domain}&sub_domain={sub_domain}&record_type=TXT&value={value}&record_line=%E9%BB%98%E8%AE%A4&ttl={ttl}")
         logging.info(f"Created TXT record: {value} (code={result.get('status', {}).get('code')})")
     else:
         # Modify existing record
         result = dnspod_call(token, 'Record.Modify',
-                             f"domain={domain}&record_id={record_id}&sub_domain={sub_domain}&record_type=TXT&value={value}&record_line=默认&ttl={ttl}")
+                             f"domain={domain}&record_id={record_id}&sub_domain={sub_domain}&record_type=TXT&value={value}&record_line=%E9%BB%98%E8%AE%A4&ttl={ttl}")
         logging.info(f"Updated TXT record: {value} (code={result.get('status', {}).get('code')})")
 
     return result.get('status', {}).get('code') == '1'

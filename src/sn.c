@@ -17,7 +17,7 @@
 struct n2n_sn;
 static int resolve_brother_addr(const char *text, n2n_sock_t *out);
 static void send_brother_reg(struct n2n_sn *sss, time_t now);
-static size_t brother_list_format(struct n2n_sn *sss, char *buf, size_t bufsz);
+static size_t brother_list_format(struct n2n_sn *sss, time_t now, char *buf, size_t bufsz);
 
 /* Build an n2n_sock_t from a recvfrom() sockaddr (family 0 if unsupported). */
 static int sock_from_sender( n2n_sock_t *out, const struct sockaddr *sa )
@@ -60,6 +60,9 @@ static int sn_get_device_mac(n2n_mac_t out_mac);
 #include <netinet/in.h>
 #include <netdb.h>
 #include <ifaddrs.h>
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__)
+#include <net/if_dl.h>  /* AF_LINK MAC lookup on macOS/BSD */
+#endif
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -76,6 +79,7 @@ static int sn_get_device_mac(n2n_mac_t out_mac)
 {
     memset(out_mac, 0, sizeof(n2n_mac_t));
 #ifndef _WIN32
+#if defined(__linux__)
     /* Walk getifaddrs, pick the first interface with any address entry
      * that is not the loopback interface. The kernel name "lo" (Linux)
      * is treated as loopback regardless of sa_family — necessary for
@@ -107,6 +111,28 @@ static int sn_get_device_mac(n2n_mac_t out_mac)
     }
     close(probe_sock);
     return 0;
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__)
+    /* macOS/BSD: no SIOCGIFHWADDR; take the first AF_LINK entry carrying a
+     * 6-byte hardware address, skipping loopback (lo*). */
+    struct ifaddrs *ifap = NULL;
+    struct ifaddrs *ifa;
+    if (getifaddrs(&ifap) != 0) return 0;
+    int ok = 0;
+    for (ifa = ifap; ifa && !ok; ifa = ifa->ifa_next) {
+        struct sockaddr_dl *sdl;
+        if (!ifa->ifa_name || !ifa->ifa_addr) continue;
+        if (ifa->ifa_addr->sa_family != AF_LINK) continue;
+        if (strncmp(ifa->ifa_name, "lo", 2) == 0) continue;
+        sdl = (struct sockaddr_dl *)ifa->ifa_addr;
+        if (sdl->sdl_alen != sizeof(n2n_mac_t)) continue;
+        memcpy(out_mac, LLADDR(sdl), sizeof(n2n_mac_t));
+        ok = 1;
+    }
+    freeifaddrs(ifap);
+    return ok;
+#else
+    return 0; /* other platforms: zero MAC; caller logs a warning */
+#endif
 #else
     ULONG buflen = 15000;
     IP_ADAPTER_ADDRESSES *addrs = (IP_ADAPTER_ADDRESSES *)malloc(buflen);
@@ -158,8 +184,16 @@ struct mac_ip_entry {
 #define COMM_STATS_MINUTES   1440   /* 24h in 1-minute buckets */
 #define COMM_STATS_DAYS      30     /* 30-day rolling window */
 #define COMM_STATS_SECONDS   5      /* instant rate averaging window */
-#define RATE_LIMIT_FACTOR    1.05   /* token bucket overshoot factor */
-#define RATE_DEBT_SECONDS    10     /* overdraft allowance before dropping */
+#define RATE_LIMIT_FACTOR    1.0    /* actual rate = limit x this factor */
+#define RATE_DEBT_SECONDS    10     /* overdraft allowance before queueing */
+#define SHAPER_SLOTS         8      /* queued packets per community (~16KB) */
+
+/* One packet parked in the shaper queue, waiting for tokens */
+struct shaper_slot {
+    uint16_t  len;
+    n2n_mac_t mac;      /* destination MAC, re-looked up at drain time */
+    uint8_t   buf[N2N_SN_PKTBUF_SIZE];
+};
 
 struct community_stats {
     n2n_community_t community_name;
@@ -190,9 +224,14 @@ struct community_stats {
     uint64_t max_24h_bytes;     /* 0 = unlimited */
     uint64_t rate_limit_bps;    /* throttle speed after 24h limit; 0 = block */
     int64_t  tokens;            /* token bucket (bytes); negative = overdraft */
-    time_t   last_token_refill;
+    int64_t  last_token_refill_ms; /* monotonic ms clock for smooth refill */
     int      bc_gate;           /* broadcast member cap while throttled
                                  * (INT_MAX = everyone) */
+
+    /* Shaper queue: packets parked instead of dropped while throttled */
+    struct shaper_slot *q;      /* lazily allocated ring of SHAPER_SLOTS */
+    int      q_r;               /* read index */
+    int      q_n;               /* queued count */
 
     /* Per-community IP auto-assignment (10.64.0.2 .. 10.64.0.254) */
     uint32_t next_ip;           /* host byte order, 0 = not yet initialised */
@@ -212,6 +251,7 @@ struct rate_limit_rule {
     uint64_t        max_24h_bytes;
     uint64_t        rate_limit_bps;
     int             bc_gate;    /* broadcast member cap while throttled */
+    int             deny;       /* 1 = deny registration (black/white list) */
     struct rate_limit_rule *next;
 };
 
@@ -313,11 +353,16 @@ static void update_community_traffic(struct community_stats *s, size_t bytes, ti
             }
         }
         s->last_second = now;
+    }
+    s->recent_seconds[s->recent_idx] += bytes;
+
+    /* Recompute on every call so the current second is always included
+     * (computing only on second-tick loses 1/5 of the window) */
+    {
         uint64_t total = 0;
         for (int k = 0; k < COMM_STATS_SECONDS; k++) total += s->recent_seconds[k];
         s->instant_Bps = total / COMM_STATS_SECONDS;
     }
-    s->recent_seconds[s->recent_idx] += bytes;
 
     /* 24h sliding window */
     advance_24h_buckets(s, now);
@@ -330,8 +375,49 @@ static void update_community_traffic(struct community_stats *s, size_t bytes, ti
     s->total_30d += bytes;
 }
 
-/* Check rate limit; returns 1 if packet should be allowed, 0 if blocked/throttled */
-static int check_rate_limit(struct community_stats *s, size_t bytes, time_t now)
+/* Monotonic milliseconds (token refill clock, sub-second precision) */
+static int64_t sn_monotonic_ms(void)
+{
+#ifdef _WIN32
+    return (int64_t)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + (int64_t)ts.tv_nsec / 1000000;
+#endif
+}
+
+/* Token bucket cap: 1 second worth of tokens. Bursts up to this pass without
+ * queueing; larger caps only enlarge the instant passthrough after idle. */
+static uint64_t token_bucket_max(struct community_stats *s)
+{
+    uint64_t max_tokens = (uint64_t)(s->rate_limit_bps * RATE_LIMIT_FACTOR);
+    uint64_t min_bucket = 4096; /* accommodate one typical MAX-sized n2n packet */
+    if (max_tokens < min_bucket) max_tokens = min_bucket;
+    return max_tokens;
+}
+
+/* Refill the token bucket from the monotonic ms clock so queued packets are
+ * released smoothly instead of in whole-second bursts. */
+static void token_refill(struct community_stats *s, uint64_t max_tokens)
+{
+    int64_t now = sn_monotonic_ms();
+    if (s->last_token_refill_ms == 0) {
+        s->last_token_refill_ms = now;
+        s->tokens = (int64_t)max_tokens; /* start full so a single packet can pass */
+        return;
+    }
+    int64_t elapsed = now - s->last_token_refill_ms;
+    if (elapsed <= 0) return;
+    s->last_token_refill_ms = now;
+    s->tokens += (int64_t)((double)elapsed * s->rate_limit_bps * RATE_LIMIT_FACTOR / 1000.0);
+    if (s->tokens > (int64_t)max_tokens) s->tokens = (int64_t)max_tokens;
+}
+
+/* Refill tokens and try to admit `bytes`; charges the bucket when admitted.
+ * Shared by the direct path (try_forward) and the shaper drain, keeping a
+ * single accounting path. Returns 1 if allowed, 0 if it must wait or block. */
+static int rate_admit(struct community_stats *s, size_t bytes)
 {
     if (s->max_24h_bytes == 0 && s->rate_limit_bps == 0)
         return 1; /* no limit */
@@ -341,28 +427,16 @@ static int check_rate_limit(struct community_stats *s, size_t bytes, time_t now)
             return 0; /* hard block */
         /* Throttle via token bucket with overdraft (credit): the bucket may
          * go negative down to RATE_DEBT_SECONDS worth of tokens. Short bursts
-         * borrow from future tokens instead of triggering drops, so TCP keeps
-         * its congestion window and only sustained over-use that exhausts the
-         * credit actually gets dropped. The bucket must always hold at least
-         * one full packet, otherwise a limit below the packet size would
-         * dead-lock the community. */
-        uint64_t max_tokens = (uint64_t)(s->rate_limit_bps * 5 * RATE_LIMIT_FACTOR);
-        uint64_t min_bucket = 4096; /* accommodate one typical MAX-sized n2n packet */
-        if (max_tokens < min_bucket) max_tokens = min_bucket;
+         * borrow from future tokens instead of delaying packets; once the
+         * credit is exhausted try_forward parks packets in the shaper queue
+         * instead of dropping them, so TCP sees no loss and keeps its
+         * congestion window. */
+        uint64_t max_tokens = token_bucket_max(s);
         int64_t debt_max = (int64_t)(s->rate_limit_bps * RATE_DEBT_SECONDS);
         if (debt_max < 16384) debt_max = 16384;
         uint64_t charge = bytes;
         if (charge > max_tokens) charge = max_tokens; /* cap single-packet charge */
-        if (s->last_token_refill == 0) {
-            s->last_token_refill = now;
-            s->tokens = (int64_t)max_tokens; /* start full so a single packet can pass */
-        }
-        time_t elapsed = now - s->last_token_refill;
-        if (elapsed > 0) {
-            s->last_token_refill = now;
-            s->tokens += (int64_t)((uint64_t)elapsed * s->rate_limit_bps * RATE_LIMIT_FACTOR);
-            if (s->tokens > (int64_t)max_tokens) s->tokens = (int64_t)max_tokens;
-        }
+        token_refill(s, max_tokens);
         if (s->tokens - (int64_t)charge < -debt_max)
             return 0; /* credit exhausted */
         s->tokens -= (int64_t)charge;
@@ -404,6 +478,7 @@ static void free_community_stats(struct community_stats **head)
             free(e);
             e = en;
         }
+        free(s->q);
         free(s);
         s = next;
     }
@@ -460,7 +535,37 @@ static void free_rate_limit_rules(struct rate_limit_rule **head)
     *head = NULL;
 }
 
-/* Parse -L config file */
+/* Black/white list lookup: is this community denied registration?
+ * Rule precedence: exact name beats "*"; at the same level x (deny) beats
+ * y (allow). No matching rule => allow (blacklist default). Checked only
+ * at REGISTER_SUPER; online edges fall off at their next re-registration. */
+static int community_denied(const struct rate_limit_rule *rules,
+                            const n2n_community_t comm)
+{
+    int level = 0, denied = 0; /* level: 0 none, 1 wildcard, 2 exact */
+    const struct rate_limit_rule *r = rules;
+    while (r) {
+        int exact = (strncmp((char *)r->community_name, (char *)comm,
+                             sizeof(n2n_community_t)) == 0);
+        int wild  = !exact && (strcmp((char *)r->community_name, "*") == 0);
+        if (exact || wild) {
+            int lvl = exact ? 2 : 1;
+            if (lvl > level) { level = lvl; denied = 0; }
+            if (r->deny) denied = 1; /* x beats y at the same level */
+        }
+        r = r->next;
+    }
+    return denied;
+}
+
+/* Access action column token: "x" (deny) or "y" (allow) */
+static int is_access_action(const char *s)
+{
+    return s[1] == '\0' &&
+           (s[0] == 'x' || s[0] == 'X' || s[0] == 'y' || s[0] == 'Y');
+}
+
+/* Parse -c config file: rate limiting + community access list */
 static void parse_rate_limit_config(const char *datpath,
                                      int *enabled,
                                      struct rate_limit_rule **rules)
@@ -475,22 +580,31 @@ static void parse_rate_limit_config(const char *datpath,
         /* Create default config */
         fp = fopen(cfgpath, "w");
         if (fp) {
-            fprintf(fp, "# N2N Supernode traffic statistics and rate limiting\n");
+            fprintf(fp, "# N2N Supernode traffic statistics, rate limiting and community access list\n");
             fprintf(fp, "# enabled on|off\n");
             fprintf(fp, "#\n");
-            fprintf(fp, "# Rules: <community> <max_24h_GB> <rate_limit_KB/s> <broadcast_members>\n");
-            fprintf(fp, "#   community       : community name, or * for all\n");
-            fprintf(fp, "#   max_24h_GB      : 24h traffic cap in GB (0=unlimited)\n");
-            fprintf(fp, "#   rate_limit_KB/s : speed in KB/s once the cap is reached (0=block all)\n");
-            fprintf(fp, "#   broadcast_members: how many members receive broadcast while throttled\n");
-            fprintf(fp, "#                       0   : everyone\n");
-            fprintf(fp, "#                       N   : at most N members (default 64)\n");
+            fprintf(fp, "# Rules: <community> <max_24h_GB> <rate_limit_KB/s> <broadcast_members> <Allow_and_block_lists>\n");
+            fprintf(fp, "#   community            : community name, or * for all\n");
+            fprintf(fp, "#   max_24h_GB           : 24h traffic cap in GB (0=unlimited)\n");
+            fprintf(fp, "#   rate_limit_KB/s      : speed in KB/s once the cap is reached (0=block all)\n");
+            fprintf(fp, "#   broadcast_members    : how many members receive broadcast while throttled\n");
+            fprintf(fp, "#                      0 : everyone; N : at most N members (default 64)\n");
+            fprintf(fp, "#   Allow_and_block_lists: x = deny registration, y = allow; optional, default y\n");
+            fprintf(fp, "#                          (may also replace broadcast_members as the last column)\n");
+            fprintf(fp, "# A community name alone means allow with no limits.\n");
+            fprintf(fp, "# Precedence: exact name beats *; x beats y on the same level.\n");
+            fprintf(fp, "# Blacklist (default allow): add x lines to deny. Whitelist: end with\n");
+            fprintf(fp, "# \"* 0 0 x\" so only y communities may register. Denial = silent drop.\n");
             fprintf(fp, "# Later rules override earlier ones; specific name beats *\n");
             fprintf(fp, "#\n");
             fprintf(fp, "# Examples:\n");
-            fprintf(fp, "#*          100    0         # global: block all after 100GB/24h\n");
-            fprintf(fp, "#n2n         50   10   64    # n2n: 10KB/s after 50GB/24h, broadcast to max 64\n");
-            fprintf(fp, "#vip          0    0         # vip: unlimited\n");
+            fprintf(fp, "#<community> <max_24h_GB> <rate_limit_KB/s> <broadcast_members> <Allow_and_block_lists>\n");
+            fprintf(fp, "#*            10            116                                                          # global: 116KB/s after 10GB/24h\n");
+            fprintf(fp, "#n2n          50            580               64                                         # n2n: 580KB/s after 50GB/24h, broadcast to max 64\n");
+            fprintf(fp, "#vip           0            0                                                            # vip: unlimited\n");
+            fprintf(fp, "#badnet        0            0                                     x                      # deny registration\n");
+            fprintf(fp, "#good                                                                                    # allow, no limits\n");
+            fprintf(fp, "#*             0            0                                     x                      # whitelist: deny all others\n");
             fprintf(fp, "\n");
             fprintf(fp, "enabled on\n");
             fclose(fp);
@@ -502,27 +616,45 @@ static void parse_rate_limit_config(const char *datpath,
     struct rate_limit_rule *tail = NULL;
     char line[256];
     while (fgets(line, sizeof(line), fp)) {
-        if (line[0] == '#' || line[0] == '\n') continue;
-        char kw[64], val[64];
-        if (sscanf(line, "%63s %63s", kw, val) == 2 &&
-            strcmp(kw, "enabled") == 0) {
-            *enabled = (strcmp(val, "on") == 0) ? 1 : 0;
+        char *tok[5];
+        int ntok = 0;
+        char *t = strtok(line, " \t\r\n");
+        while (t && ntok < 5) {         /* stop at '#' or after 5 columns */
+            if (t[0] == '#') break;
+            tok[ntok++] = t;
+            t = strtok(NULL, " \t\r\n");
+        }
+        if (ntok == 0) continue;
+        if (ntok >= 2 && strcmp(tok[0], "enabled") == 0) {
+            *enabled = (strcmp(tok[1], "on") == 0) ? 1 : 0;
             continue;
         }
-        double max_gb, rate_kbps;
-        char gate[64] = "64";
-        if (sscanf(line, "%63s %lf %lf %63s", kw, &max_gb, &rate_kbps, gate) >= 3) {
-            struct rate_limit_rule *r = (struct rate_limit_rule*)calloc(1, sizeof(*r));
-            if (!r) continue;
-            strncpy((char*)r->community_name, kw, sizeof(n2n_community_t) - 1);
-            r->max_24h_bytes  = (uint64_t)(max_gb * 1024.0 * 1024.0 * 1024.0);
-            r->rate_limit_bps = (uint64_t)(rate_kbps * 1024);
-            r->bc_gate = atoi(gate);
-            if (r->bc_gate <= 0)
-                r->bc_gate = INT_MAX; /* 0 = everyone */
-            if (!tail) { *rules = r; tail = r; }
-            else { tail->next = r; tail = r; }
+        /* Trailing access action: x = deny, y = allow (default) */
+        const char *act = NULL;
+        if (ntok >= 2 && is_access_action(tok[ntok - 1])) { act = tok[ntok - 1]; ntok--; }
+        double max_gb = 0, rate_kbps = 0;
+        int bc = 64;
+        if (ntok == 4) {
+            bc = atoi(tok[3]);
+            max_gb = atof(tok[1]); rate_kbps = atof(tok[2]);
+        } else if (ntok == 3) {
+            max_gb = atof(tok[1]); rate_kbps = atof(tok[2]);
+        } else if (ntok >= 2) {
+            continue; /* unsupported column count, ignore like before */
         }
+        /* ntok == 1: community-only line = allow, no limits (compatible
+         * with official community.list) */
+        struct rate_limit_rule *r = (struct rate_limit_rule*)calloc(1, sizeof(*r));
+        if (!r) continue;
+        strncpy((char*)r->community_name, tok[0], sizeof(n2n_community_t) - 1);
+        r->max_24h_bytes  = (uint64_t)(max_gb * 1024.0 * 1024.0 * 1024.0);
+        r->rate_limit_bps = (uint64_t)(rate_kbps * 1024);
+        r->bc_gate = bc;
+        if (r->bc_gate <= 0)
+            r->bc_gate = INT_MAX; /* 0 = everyone */
+        r->deny = act ? (tolower((unsigned char)act[0]) == 'x') : 0;
+        if (!tail) { *rules = r; tail = r; }
+        else { tail->next = r; tail = r; }
     }
     fclose(fp);
 }
@@ -721,6 +853,7 @@ static void purge_expired_community_stats(n2n_sn_t *sss, time_t *p_last_purge, t
             *pp = s->next;
             struct mac_ip_entry *e = s->mac_ip_map;
             while (e) { struct mac_ip_entry *en = e->next; free(e); e = en; }
+            free(s->q);
             free(s);
             continue;
         }
@@ -738,6 +871,7 @@ static void purge_expired_community_stats(n2n_sn_t *sss, time_t *p_last_purge, t
             *pp = s->next;
             struct mac_ip_entry *e = s->mac_ip_map;
             while (e) { struct mac_ip_entry *en = e->next; free(e); e = en; }
+            free(s->q);
             free(s);
             continue;
         }
@@ -868,8 +1002,13 @@ static void deinit_sn( n2n_sn_t * sss )
 
 /* brother_list bookkeeping and the helpers that drive it. */
 
+/* Mgmt table header, shared by the brother and edges tables so the column
+ * positions (e.g. the trailing "os" column) stay in sync. */
+static const char mgmt_header[] =
+    "  id  mac                n2n_ip           wan_ip               <KB/s     GB/24h   GB/30d>  ver      os\n";
+
 /* brother_list display helper: format brother SN status lines (for -Q / trace). */
-static size_t brother_list_format(n2n_sn_t *sss, char *buf, size_t bufsz)
+static size_t brother_list_format(n2n_sn_t *sss, time_t now, char *buf, size_t bufsz)
 {
     size_t written = 0;
     int shown = 0;
@@ -899,11 +1038,20 @@ static size_t brother_list_format(n2n_sn_t *sss, char *buf, size_t bufsz)
             inet_ntop(AF_INET6, b->sock6.addr.v6, v6_str, sizeof(v6_str));
             snprintf(v6_part, sizeof(v6_part), "[%s]:%u", v6_str, b->sock6.port);
         }
+        /* Heartbeat age: v4 first, v6 fallback; left-aligned to the "os"
+         * column of the header. (have_v4 || have_v6 is guaranteed above,
+         * so the slot always has a last-seen timestamp.) */
+        time_t last = b->seen ? b->seen : b->seen6;
+        size_t line_start = written;
         written += snprintf(buf + written, bufsz - written,
-                            "%4d  %02X:%02X:%02X:%02X:%02X:%02X  %s/%s\n",
+                            "%4d  %02X:%02X:%02X:%02X:%02X:%02X  %s/%s",
                             counter,
                             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
                             v4_part, v6_part);
+        int pad = (int)sizeof(mgmt_header) - 4 - (int)(written - line_start);
+        if (pad < 1) pad = 1;
+        written += snprintf(buf + written, bufsz - written,
+                            "%*s%lds\n", pad, "", (long)(now - last));
         shown++;
     }
     return written;
@@ -1476,6 +1624,53 @@ static ssize_t sendto_sock(n2n_sn_t * sss,
     return sent;
 }
 
+/* ===== Compromise shaper: small FIFO queue instead of drops =====
+ * While throttled, packets that exceed the token credit are parked here
+ * (SHAPER_SLOTS x ~2KB ~ 16KB, ~140ms at 115KB/s) and released FIFO as the
+ * bucket refills. TCP sees no loss, avoiding retransmission storms; the cost
+ * is added queueing latency. One queue per community, lazily allocated. */
+static int shaper_enqueue(struct community_stats *s,
+                          const n2n_mac_t mac,
+                          const uint8_t *pktbuf, size_t pktsize)
+{
+    if (pktsize > N2N_SN_PKTBUF_SIZE) return 0;
+    if (!s->q) {
+        s->q = (struct shaper_slot*)calloc(SHAPER_SLOTS, sizeof(struct shaper_slot));
+        if (!s->q) return 0;
+    }
+    if (s->q_n >= SHAPER_SLOTS) return 0; /* queue full: tail drop */
+    struct shaper_slot *sl = &s->q[(s->q_r + s->q_n) % SHAPER_SLOTS];
+    memcpy(sl->mac, mac, sizeof(n2n_mac_t));
+    sl->len = (uint16_t)pktsize;
+    memcpy(sl->buf, pktbuf, pktsize);
+    s->q_n++;
+    return 1;
+}
+
+/* Release queued packets in FIFO order as the token bucket refills. */
+static void shaper_drain(n2n_sn_t *sss, struct community_stats *s)
+{
+    if (!s->q || s->q_n == 0) return;
+    time_t now = time(NULL);
+    while (s->q_n > 0) {
+        struct shaper_slot *sl = &s->q[s->q_r];
+        struct peer_info *peer = find_peer_by_mac(sss->edges, sl->mac);
+        if (!peer) {
+            /* destination vanished while queued: drop this slot */
+            s->q_r = (s->q_r + 1) % SHAPER_SLOTS;
+            s->q_n--;
+            continue;
+        }
+        if (!rate_admit(s, sl->len)) break; /* out of credit: wait for refill */
+        if (sn_send_to_peer(sss, peer, sl->buf, sl->len) == (ssize_t)sl->len) {
+            ++(sss->stats.fwd);
+            update_community_traffic(s, sl->len, now);
+        }
+        s->q_r = (s->q_r + 1) % SHAPER_SLOTS;
+        s->q_n--;
+    }
+}
+
 
 /** Try to forward a message to a unicast MAC. If the MAC is unknown then
  *  broadcast to all edges in the destination community.
@@ -1511,8 +1706,15 @@ static int try_forward( n2n_sn_t * sss,
             /* Apply rules on first use (new entry has zeroed limits) */
             if (cs->rate_limit_bps == 0 && cs->max_24h_bytes == 0)
                 apply_rules_to_stats(cs, sss->rate_rules);
-            if (!check_rate_limit(cs, pktsize, now)) {
-                traceEvent(TRACE_DEBUG, "rate limit drop for community %s", cmn->community);
+            shaper_drain(sss, cs);
+            if (!rate_admit(cs, pktsize)) {
+                if (cs->rate_limit_bps > 0 &&
+                    shaper_enqueue(cs, scan->mac_addr, pktbuf, pktsize)) {
+                    traceEvent(TRACE_DEBUG, "shaper queued %lu for community %s",
+                               (unsigned long)pktsize, cmn->community);
+                } else {
+                    traceEvent(TRACE_DEBUG, "rate limit drop for community %s", cmn->community);
+                }
                 return 0;
             }
         }
@@ -1610,13 +1812,12 @@ static int process_mgmt( n2n_sn_t * sss,
     }
 
     /* Send header */
-    ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
-                      "  id  mac                n2n_ip           wan_ip               <KB/s     GB/24h   GB/30d>  ver      os\n");
+    ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%s", mgmt_header);
 	if (ressize < N2N_SN_PKTBUF_SIZE)
         ressize += snprintf(resbuf + ressize, N2N_SN_PKTBUF_SIZE - ressize,
                            "---v2.3----------------------------------------------------------------------------------------------------\n");
     /* brother table sits between the two v2.3 separator lines */
-    ressize += brother_list_format(sss, resbuf + ressize, N2N_SN_PKTBUF_SIZE - ressize);
+    ressize += brother_list_format(sss, time(NULL), resbuf + ressize, N2N_SN_PKTBUF_SIZE - ressize);
 
     r = sendto(sss->mgmt_sock, resbuf, ressize, 0,
                sender_sock, sender_sock_len);
@@ -2684,6 +2885,12 @@ static int process_udp( n2n_sn_t * sss,
             return 0; /* brother registration does not need an ACK */
         }
 
+        /* Black/white list: silently drop registration for denied
+         * communities (no reply, so the SN stays hidden). brother_reg
+         * above is exempt from this check. */
+        if (community_denied(sss->rate_rules, cmn.community))
+            return 0;
+
         /* Edge registration: validate peer_token (if configured).
          * Brother-trusted source: if the edge arrives from a registered
          * brother sn1 (recently seen, sender matches its sock), the peer is
@@ -3001,10 +3208,11 @@ static void help(int argc, char * const argv[])
     printf("\n");
 
     fprintf( stderr, "-l <lport>\tSet UDP main listen port to <lport>.\n" );
-    fprintf( stderr, "-L <file> \tTraffic statistics file (config auto-derived as .cfg).\n" );
     fprintf( stderr, "-4|-6     \tIP mode: -4 (IPv4 only), -6 (IPv6 only), both/none (dual-stack).\n" );
     fprintf( stderr, "-b <host:port>\tBrother supernode address.\n" );
     fprintf( stderr, "-B <token>\tToken required from brother SNs (no -B = accept any brother).\n" );
+    fprintf( stderr, "-c <file> \tCommunity access list, traffic stats and limiting (config auto-derived as .cfg)\n" );
+    fprintf( stderr, "          \tConfigure traffic stats file: -c abc.dat, modify abc.cfg after startup.\n" );
     fprintf( stderr, "-E <token>\tToken required from edges.\n" );
 #if defined(N2N_HAVE_DAEMON)
     fprintf( stderr, "-f        \tRun in foreground.\n" );
@@ -3087,7 +3295,7 @@ int main( int argc, char * const argv[] )
     {
         int opt;
 
-        while((opt = getopt_long(argc, argv, "ft:l:L:46vhE:B:b:", long_options, NULL)) != -1)
+        while((opt = getopt_long(argc, argv, "ft:l:c:46vhE:B:b:", long_options, NULL)) != -1)
         {
             switch (opt)
             {
@@ -3095,7 +3303,7 @@ int main( int argc, char * const argv[] )
                 sss.lport = atoi(optarg);
 																lport_specified = 1;
                 break;
-            case 'L': /* traffic stats and rate limiting config */
+            case 'c': /* traffic stats, rate limiting and community access list config */
                 strncpy(sss.stats_config_path, optarg, sizeof(sss.stats_config_path) - 1);
                 parse_rate_limit_config(sss.stats_config_path,
                                         &sss.traffic_stats_enabled,
@@ -3370,12 +3578,19 @@ static int run_loop( n2n_sn_t * sss )
             }
         }
 
-        wait_time.tv_sec = 10; /* 10-second timeout */
-        wait_time.tv_usec = 0;
+        wait_time.tv_sec = 0;   /* wake at least every 100ms to drain shaper queues */
+        wait_time.tv_usec = 100 * 1000;
 
         rc = select(max_sock+1, &socket_mask, NULL, NULL, &wait_time);
 
         now = time(NULL);
+
+        /* Shaper: release queued packets as tokens refill (all communities) */
+        if (sss->traffic_stats_enabled) {
+            struct community_stats *s;
+            for (s = sss->comm_stats; s; s = s->next)
+                shaper_drain(sss, s);
+        }
 
         if(rc > 0)
         {
@@ -3504,9 +3719,9 @@ static int run_loop( n2n_sn_t * sss )
             save_community_stats(sss, now);
         }
 
-        /* Re-read the rate limit config every 5 minutes so edits apply
-         * without a restart. Kept outside the traffic_stats_enabled gate so
-         * "enabled on|off" can be toggled from the file itself. */
+        /* Re-read the rate limit and access config every 5 minutes so edits
+         * apply without a restart. Kept outside the traffic_stats_enabled
+         * gate so "enabled on|off" can be toggled from the file itself. */
         if (sss->stats_config_path[0])
         {
             static time_t last_cfg_reload = 0;
@@ -3526,11 +3741,11 @@ static int run_loop( n2n_sn_t * sss )
             }
         }
 
-        /* sn1 -> sn2 brother_reg, every 60s. */
+        /* sn1 -> sn2 brother_reg, every 31s. */
         if (sss->backup_addr_text[0])
         {
             static time_t last_brother_reg = 0;
-            if (now - last_brother_reg >= 60)
+            if (now - last_brother_reg >= 31)
             {
                 last_brother_reg = now;
                 send_brother_reg(sss, now);

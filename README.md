@@ -1,6 +1,6 @@
 # n2n6 - A Peer-to-Peer VPN
 
-[English](README.md) | [中文版](README.zh.md)
+[English](README.md) | [Chinese](README.zh.md)
 
 ---
 
@@ -40,7 +40,7 @@ If UDP is blocked on your network, add `-w` to enable WebSocket relay.
 | **IPv4/IPv6 dual stack** | Transport and inner addressing |
 | **Auto IP assignment** | Per-community IP pool (10.64.0.x), no DHCP needed |
 | **Packet forwarding** (`-r`) | Route traffic through the n2n community |
-| **Traffic stats & rate limiting** (`-L`) | Supernode per-community 24h/30d stats |
+| **Traffic stats & rate limiting** (`-c`) | Supernode per-community 24h/30d stats |
 
 ### Management Interface
 

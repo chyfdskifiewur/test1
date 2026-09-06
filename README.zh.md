@@ -40,7 +40,7 @@ edge -a 10.64.0.3 -c mynetwork -k secret -A4 -l supernode.example.com:1234
 | **IPv4/IPv6 双栈** | 支持传输层和内网层双协议 |
 | **自动 IP 分配** | 每社区独立 IP 池，无需 DHCP |
 | **包转发** (`-r`) | 通过 n2n 社区转发流量 |
-| **流量统计与限速** (`-L`) | Supernode 端 24h/30d 统计 |
+| **流量统计与限速** (`-c`) | Supernode 端 24h/30d 统计 |
 
 ### 管理接口
 
