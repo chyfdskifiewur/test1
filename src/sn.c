@@ -48,6 +48,7 @@ static int sock_from_sender( n2n_sock_t *out, const struct sockaddr *sa )
 static int sn_get_device_mac(n2n_mac_t out_mac);
 #include <signal.h>
 #include <inttypes.h>
+#include <limits.h>
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -158,6 +159,7 @@ struct mac_ip_entry {
 #define COMM_STATS_DAYS      30     /* 30-day rolling window */
 #define COMM_STATS_SECONDS   5      /* instant rate averaging window */
 #define RATE_LIMIT_FACTOR    1.05   /* token bucket overshoot factor */
+#define RATE_DEBT_SECONDS    10     /* overdraft allowance before dropping */
 
 struct community_stats {
     n2n_community_t community_name;
@@ -187,8 +189,10 @@ struct community_stats {
     /* Rate limiting */
     uint64_t max_24h_bytes;     /* 0 = unlimited */
     uint64_t rate_limit_bps;    /* throttle speed after 24h limit; 0 = block */
-    uint64_t tokens;            /* token bucket (bytes) */
+    int64_t  tokens;            /* token bucket (bytes); negative = overdraft */
     time_t   last_token_refill;
+    int      bc_gate;           /* broadcast member cap while throttled
+                                 * (INT_MAX = everyone) */
 
     /* Per-community IP auto-assignment (10.64.0.2 .. 10.64.0.254) */
     uint32_t next_ip;           /* host byte order, 0 = not yet initialised */
@@ -207,6 +211,7 @@ struct rate_limit_rule {
     n2n_community_t community_name; /* "*" matches all */
     uint64_t        max_24h_bytes;
     uint64_t        rate_limit_bps;
+    int             bc_gate;    /* broadcast member cap while throttled */
     struct rate_limit_rule *next;
 };
 
@@ -233,6 +238,7 @@ static struct community_stats * get_community_stats(
     s->next_ip     = 0x0a400002; /* 10.64.0.2 - per-community start */
     s->mac_ip_map  = NULL;
     s->all_compact = 1;          /* assume all new edges are compact until proven otherwise */
+    s->bc_gate     = INT_MAX;    /* default: broadcast to everyone */
     s->next = *head;
     *head = s;
     return s;
@@ -330,29 +336,36 @@ static int check_rate_limit(struct community_stats *s, size_t bytes, time_t now)
     if (s->max_24h_bytes == 0 && s->rate_limit_bps == 0)
         return 1; /* no limit */
 
-    uint64_t total_24h = s->last_24h_bytes;
-
-    if (s->max_24h_bytes > 0 && total_24h >= s->max_24h_bytes) {
+    if (s->max_24h_bytes > 0 && s->last_24h_bytes >= s->max_24h_bytes) {
         if (s->rate_limit_bps == 0)
             return 0; /* hard block */
-        /* Throttle via token bucket. The bucket must always be able to hold
-         * at least one full packet, otherwise a limit set below the packet
-         * size would dead-lock the community (no packet could ever pass). */
+        /* Throttle via token bucket with overdraft (credit): the bucket may
+         * go negative down to RATE_DEBT_SECONDS worth of tokens. Short bursts
+         * borrow from future tokens instead of triggering drops, so TCP keeps
+         * its congestion window and only sustained over-use that exhausts the
+         * credit actually gets dropped. The bucket must always hold at least
+         * one full packet, otherwise a limit below the packet size would
+         * dead-lock the community. */
         uint64_t max_tokens = (uint64_t)(s->rate_limit_bps * 5 * RATE_LIMIT_FACTOR);
         uint64_t min_bucket = 4096; /* accommodate one typical MAX-sized n2n packet */
         if (max_tokens < min_bucket) max_tokens = min_bucket;
+        int64_t debt_max = (int64_t)(s->rate_limit_bps * RATE_DEBT_SECONDS);
+        if (debt_max < 16384) debt_max = 16384;
+        uint64_t charge = bytes;
+        if (charge > max_tokens) charge = max_tokens; /* cap single-packet charge */
         if (s->last_token_refill == 0) {
             s->last_token_refill = now;
-            s->tokens = max_tokens; /* start full so a single packet can pass */
+            s->tokens = (int64_t)max_tokens; /* start full so a single packet can pass */
         }
         time_t elapsed = now - s->last_token_refill;
         if (elapsed > 0) {
             s->last_token_refill = now;
-            s->tokens += (uint64_t)(elapsed * s->rate_limit_bps * RATE_LIMIT_FACTOR);
-            if (s->tokens > max_tokens) s->tokens = max_tokens;
+            s->tokens += (int64_t)((uint64_t)elapsed * s->rate_limit_bps * RATE_LIMIT_FACTOR);
+            if (s->tokens > (int64_t)max_tokens) s->tokens = (int64_t)max_tokens;
         }
-        if (s->tokens < bytes) return 0;
-        s->tokens -= bytes;
+        if (s->tokens - (int64_t)charge < -debt_max)
+            return 0; /* credit exhausted */
+        s->tokens -= (int64_t)charge;
     }
     return 1;
 }
@@ -363,12 +376,14 @@ static void apply_rules_to_stats(struct community_stats *s,
 {
     s->max_24h_bytes  = 0;
     s->rate_limit_bps = 0;
+    s->bc_gate        = INT_MAX;
     struct rate_limit_rule *r = rules;
     while (r) {
         if (strcmp((char*)r->community_name, "*") == 0 ||
             memcmp(r->community_name, s->community_name, sizeof(n2n_community_t)) == 0) {
             s->max_24h_bytes  = r->max_24h_bytes;
             s->rate_limit_bps = r->rate_limit_bps;
+            s->bc_gate        = r->bc_gate;
             if (strcmp((char*)r->community_name, (char*)s->community_name) == 0)
                 break; /* specific rule wins over wildcard */
         }
@@ -463,16 +478,19 @@ static void parse_rate_limit_config(const char *datpath,
             fprintf(fp, "# N2N Supernode traffic statistics and rate limiting\n");
             fprintf(fp, "# enabled on|off\n");
             fprintf(fp, "#\n");
-            fprintf(fp, "# Rules: <community> <rate_limit_KB/s> <max_24h_GB>\n");
+            fprintf(fp, "# Rules: <community> <max_24h_GB> <rate_limit_KB/s> <broadcast_members>\n");
             fprintf(fp, "#   community       : community name, or * for all\n");
-            fprintf(fp, "#   rate_limit_KB/s : speed after 24h limit exceeded (0=block)\n");
-            fprintf(fp, "#   max_24h_GB      : 24h traffic cap (0=unlimited)\n");
+            fprintf(fp, "#   max_24h_GB      : 24h traffic cap in GB (0=unlimited)\n");
+            fprintf(fp, "#   rate_limit_KB/s : speed in KB/s once the cap is reached (0=block all)\n");
+            fprintf(fp, "#   broadcast_members: how many members receive broadcast while throttled\n");
+            fprintf(fp, "#                       0   : everyone\n");
+            fprintf(fp, "#                       N   : at most N members (default 64)\n");
             fprintf(fp, "# Later rules override earlier ones; specific name beats *\n");
             fprintf(fp, "#\n");
             fprintf(fp, "# Examples:\n");
-            fprintf(fp, "#*          0    100    # global: block after 100GB/24h\n");
-            fprintf(fp, "#n2n       10     50    # n2n: throttle to 10KB/s after 50GB/24h\n");
-            fprintf(fp, "#vip        0      0    # vip: unlimited\n");
+            fprintf(fp, "#*          100    0         # global: block all after 100GB/24h\n");
+            fprintf(fp, "#n2n         50   10   64    # n2n: 10KB/s after 50GB/24h, broadcast to max 64\n");
+            fprintf(fp, "#vip          0    0         # vip: unlimited\n");
             fprintf(fp, "\n");
             fprintf(fp, "enabled on\n");
             fclose(fp);
@@ -491,13 +509,17 @@ static void parse_rate_limit_config(const char *datpath,
             *enabled = (strcmp(val, "on") == 0) ? 1 : 0;
             continue;
         }
-        double rate_kbps, max_gb;
-        if (sscanf(line, "%63s %lf %lf", kw, &rate_kbps, &max_gb) == 3) {
+        double max_gb, rate_kbps;
+        char gate[64] = "64";
+        if (sscanf(line, "%63s %lf %lf %63s", kw, &max_gb, &rate_kbps, gate) >= 3) {
             struct rate_limit_rule *r = (struct rate_limit_rule*)calloc(1, sizeof(*r));
             if (!r) continue;
             strncpy((char*)r->community_name, kw, sizeof(n2n_community_t) - 1);
-            r->rate_limit_bps = (uint64_t)(rate_kbps * 1024);
             r->max_24h_bytes  = (uint64_t)(max_gb * 1024.0 * 1024.0 * 1024.0);
+            r->rate_limit_bps = (uint64_t)(rate_kbps * 1024);
+            r->bc_gate = atoi(gate);
+            if (r->bc_gate <= 0)
+                r->bc_gate = INT_MAX; /* 0 = everyone */
             if (!tail) { *rules = r; tail = r; }
             else { tail->next = r; tail = r; }
         }
@@ -1881,37 +1903,32 @@ static int try_broadcast( n2n_sn_t * sss,
     struct peer_info *  scan;
     struct community_stats *cs = NULL;
     int bc_count = 0;
+    int bc_limit = INT_MAX; /* broadcast member cap while throttled */
     macstr_t            mac_buf;
     n2n_sock_str_t      sockbuf;
     time_t              now = time(NULL);
 
     traceEvent( TRACE_DEBUG, "try_broadcast" );
 
-    /* Rate limiting check for broadcast.
-     * Server-perspective accounting: a broadcast is sent once per member,
-     * so the actual egress bytes are pktsize * member_count. Check against
-     * the full amount up front so one broadcast cannot bypass the limit by
-     * only consuming a single packet's quota. */
+    /* Broadcast throttle policy (B1 simple gate): broadcasts never enter the
+     * token bucket (a per-member charge would dead-lock them), instead their
+     * fan-out is capped by bc_gate while the community is over its 24h cap.
+     * Accounting still records what is actually sent, so broadcast traffic
+     * keeps counting towards the 24h quota. */
     if (sss->traffic_stats_enabled) {
         cs = get_community_stats(&sss->comm_stats,
                                                       cmn->community, now);
         if (cs) {
             if (cs->rate_limit_bps == 0 && cs->max_24h_bytes == 0)
                 apply_rules_to_stats(cs, sss->rate_rules);
-            /* Count members (excluding sender) for up-front limit check */
-            size_t member_count = 0;
-            struct peer_info *m = sss->edges;
-            while (m) {
-                if (memcmp(m->community_name, cmn->community, sizeof(n2n_community_t)) == 0
-                    && memcmp(srcMac, m->mac_addr, sizeof(n2n_mac_t)) != 0)
-                    member_count++;
-                m = m->next;
-            }
-            if (!check_rate_limit(cs, pktsize * (member_count ? member_count : 1), now)) {
-                traceEvent(TRACE_DEBUG, "rate limit drop broadcast for community %s "
-                           "(%u members)",
-                           cmn->community, (unsigned)member_count);
-                return 0;
+            if (cs->max_24h_bytes > 0 && cs->last_24h_bytes >= cs->max_24h_bytes) {
+                if (cs->rate_limit_bps == 0) {
+                    /* hard block: no broadcast at all */
+                    traceEvent(TRACE_DEBUG, "rate limit drop broadcast for community %s",
+                               cmn->community);
+                    return 0;
+                }
+                bc_limit = cs->bc_gate;
             }
         }
     }
@@ -1922,6 +1939,8 @@ static int try_broadcast( n2n_sn_t * sss,
         if( 0 == (memcmp(scan->community_name, cmn->community, sizeof(n2n_community_t)) )
             && (0 != memcmp(srcMac, scan->mac_addr, sizeof(n2n_mac_t)) ) )
         {
+            if (bc_count >= bc_limit)
+                break; /* gate reached: stop forwarding to further members */
             ssize_t data_sent_len;
             n2n_sock_t *primary = (scan->connect_family == AF_INET6 &&
                                    scan->sock6.family == AF_INET6)
@@ -3483,6 +3502,28 @@ static int run_loop( n2n_sn_t * sss )
             static time_t last_stats_purge = 0;
             purge_expired_community_stats(sss, &last_stats_purge, now);
             save_community_stats(sss, now);
+        }
+
+        /* Re-read the rate limit config every 5 minutes so edits apply
+         * without a restart. Kept outside the traffic_stats_enabled gate so
+         * "enabled on|off" can be toggled from the file itself. */
+        if (sss->stats_config_path[0])
+        {
+            static time_t last_cfg_reload = 0;
+            if (last_cfg_reload == 0)
+                last_cfg_reload = now;
+            else if (now - last_cfg_reload >= 300)
+            {
+                last_cfg_reload = now;
+                parse_rate_limit_config(sss->stats_config_path,
+                                        &sss->traffic_stats_enabled,
+                                        &sss->rate_rules);
+                /* Re-apply rules to all known communities so changed,
+                 * added and removed limits take effect immediately. */
+                for (struct community_stats *s = sss->comm_stats; s; s = s->next)
+                    apply_rules_to_stats(s, sss->rate_rules);
+                traceEvent(TRACE_DEBUG, "Rate limit config reloaded");
+            }
         }
 
         /* sn1 -> sn2 brother_reg, every 60s. */
