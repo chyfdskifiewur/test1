@@ -2440,6 +2440,11 @@ static void sn_switch_to( n2n_edge_t * eee, size_t idx )
     eee->sn_idx = idx;
     eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;   /* fresh retry budget */
 
+    /* The periodic-resolve cache refers to the previously active supernode's
+     * address; keep it from mis-reporting "address updated" (and from
+     * rotating the cookie) after the switch. */
+    memset( &eee->last_resolved_supernode, 0, sizeof(n2n_sock_t) );
+
     /* Active supernode address. */
     supernode2addr( &(eee->supernode), eee->sn_af, eee->sn_ip_array[idx] );
 
@@ -4695,19 +4700,26 @@ process_n2n_packet:
                      * sn2 answering is NOT proof sn1 is back. From sn1 itself:
                      * failback to the probed address; afterwards the edge
                      * registers solely with sn1. */
-                    if ( sock_equal( &sender, &eee->sn_query ) == 0 &&
-                         ra.sn_bak.family != 0 )
+                    if ( sock_equal( &sender, &eee->sn_query ) == 0 )
                     {
-                        cache_sn1_addr( eee, ra.sn_bak_str, ra.sn_bak_str_len,
-                                        &ra.sn_bak );
-                        if ( mac_nonzero( ra.sn1_mac ) )
-                            memcpy( eee->sn1_mac, ra.sn1_mac, N2N_MAC_SIZE );
-                        if ( ra.sn_bak_v6.family == AF_INET6 )
-                            memcpy( &eee->sn1_v6, &ra.sn_bak_v6,
-                                    sizeof(n2n_sock_t) );
-                        traceEvent( TRACE_DEBUG,
-                                    "sn2 reports sn1 at %s (probe)",
-                                    sock_to_cstr( sockbuf1, &ra.sn_bak ) );
+                        /* sn2 answered the probe: it is alive. Keep last_sup
+                         * fresh so a rejected-but-alive sn2 (e.g. -E gate
+                         * while the promoted list is not yet rebuilt) does
+                         * not trip sn_all_failed. */
+                        eee->last_sup = now;
+                        if ( ra.sn_bak.family != 0 )
+                        {
+                            cache_sn1_addr( eee, ra.sn_bak_str, ra.sn_bak_str_len,
+                                            &ra.sn_bak );
+                            if ( mac_nonzero( ra.sn1_mac ) )
+                                memcpy( eee->sn1_mac, ra.sn1_mac, N2N_MAC_SIZE );
+                            if ( ra.sn_bak_v6.family == AF_INET6 )
+                                memcpy( &eee->sn1_v6, &ra.sn_bak_v6,
+                                        sizeof(n2n_sock_t) );
+                            traceEvent( TRACE_DEBUG,
+                                        "sn2 reports sn1 at %s (probe)",
+                                        sock_to_cstr( sockbuf1, &ra.sn_bak ) );
+                        }
                     }
                     else if ( eee->sn1_probe_addr.family != 0 &&
                               sock_equal( &sender, &eee->sn1_probe_addr ) == 0 )
@@ -5021,13 +5033,12 @@ process_n2n_packet:
                 else
                 {
                     /* Transient: an in-flight ACK carrying a pre-rotation
-                     * cookie arrived late (multi-probe failover). It usually
-                     * self-heals once the fresh registration ACK matches. Keep
-                     * the re-registration but log at info to avoid storming the
-                     * log with what is essentially a benign race. */
-                    traceEvent( TRACE_INFO, "Rx REGISTER_SUPER_ACK with old cookie (stale ACK, re-registering)." );
-                    /* SN restarted — force immediate re-registration */
-                    eee->last_register_req = 0;
+                     * cookie arrived late (multi-probe failover). Benign —
+                     * the next periodic registration refreshes the cookie
+                     * match, so do NOT force an immediate re-registration
+                     * here (that would rotate the cookie again and sustain
+                     * a stale-ACK storm). */
+                    traceEvent( TRACE_DEBUG, "Rx REGISTER_SUPER_ACK with old cookie (stale, ignored)." );
                 }
             }
             else

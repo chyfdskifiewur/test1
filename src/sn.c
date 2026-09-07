@@ -672,6 +672,19 @@ struct sn_stats
 
 typedef struct sn_stats sn_stats_t;
 
+/* Promoted-peer list: edges that proved their sn1 affiliation by sending an
+ * ask_backup/QUERY_ONLY probe whose desired_sn1_mac matches a brother-table
+ * entry. Recorded so their later real registration after the failover switch
+ * (which carries no sn1 hint and no sn2 token) is admitted when -E is set. */
+#define PROMOTED_LIST_MAX  32
+#define PROMOTED_TTL       180   /* refreshed by probes and registrations */
+
+struct promoted_peer {
+    n2n_mac_t       mac;
+    n2n_community_t community;
+    time_t          seen;    /* last probe/registration time (0 = free slot) */
+};
+
 struct n2n_sn
 {
     time_t              start_time;     /* Used to measure uptime. */
@@ -703,6 +716,7 @@ struct n2n_sn
     int                    peer_token_set;
     n2n_auth_t             backup_token;   /* token required from brother SNs (-B) */
     int                    backup_token_set;
+    struct promoted_peer   promoted[PROMOTED_LIST_MAX]; /* ask-backup-verified sn1 edges */
     char                   backup_addr_text[256]; /* sn2 address (sn1 given via -b) */
     time_t                 last_brother_seen;
     n2n_mac_t              device_mac;       /* local NIC MAC used as SN identity in brother_reg */
@@ -889,6 +903,53 @@ static int is_private_ipv4(const uint8_t addr[IPV4_SIZE])
     return 0;
 }
 
+/* Find a live promoted entry (mac + community, not expired).
+ * Expired slots are lazily cleared on the way. */
+static struct promoted_peer * find_promoted( n2n_sn_t *sss,
+                                             const n2n_mac_t mac,
+                                             const n2n_community_t community,
+                                             time_t now )
+{
+    for (int i = 0; i < PROMOTED_LIST_MAX; i++)
+    {
+        struct promoted_peer *p = &sss->promoted[i];
+        if (p->seen == 0) continue;
+        if (now - p->seen > PROMOTED_TTL) { p->seen = 0; continue; }
+        if (memcmp(p->mac, mac, N2N_MAC_SIZE) == 0 &&
+            memcmp(p->community, community, sizeof(n2n_community_t)) == 0)
+            return p;
+    }
+    return NULL;
+}
+
+/* Record or refresh a promoted entry (probe verified this edge belongs to sn1). */
+static void record_promoted( n2n_sn_t *sss,
+                             const n2n_mac_t mac,
+                             const n2n_community_t community,
+                             time_t now )
+{
+    struct promoted_peer *free_slot = NULL, *oldest = NULL;
+    time_t oldest_t = (time_t)(~(time_t)0);
+
+    for (int i = 0; i < PROMOTED_LIST_MAX; i++)
+    {
+        struct promoted_peer *p = &sss->promoted[i];
+        if (p->seen == 0) { if (!free_slot) free_slot = p; continue; }
+        if (memcmp(p->mac, mac, N2N_MAC_SIZE) == 0 &&
+            memcmp(p->community, community, sizeof(n2n_community_t)) == 0)
+        {
+            p->seen = now; /* refresh */
+            return;
+        }
+        if (p->seen < oldest_t) { oldest_t = p->seen; oldest = p; }
+    }
+    if (!free_slot) free_slot = oldest; /* replace oldest when full */
+    if (!free_slot) return;
+    memcpy(free_slot->mac, mac, N2N_MAC_SIZE);
+    memcpy(free_slot->community, community, sizeof(n2n_community_t));
+    free_slot->seen = now;
+}
+
 static int update_edge( n2n_sn_t * sss,
                         const n2n_mac_t edgeMac,
                         const n2n_community_t community,
@@ -1025,7 +1086,7 @@ static size_t brother_list_format(n2n_sn_t *sss, time_t now, char *buf, size_t b
         if (!have_v4 && !have_v6) continue;
 
         if (shown == 0)
-            written += snprintf(buf + written, bufsz - written, "brother*\n");
+            written += snprintf(buf + written, bufsz - written, "[brother]\n");
         counter++;
         const uint8_t *mac = b->mac;
         char v4_part[64] = "-";
@@ -1664,6 +1725,7 @@ static void shaper_drain(n2n_sn_t *sss, struct community_stats *s)
         if (!rate_admit(s, sl->len)) break; /* out of credit: wait for refill */
         if (sn_send_to_peer(sss, peer, sl->buf, sl->len) == (ssize_t)sl->len) {
             ++(sss->stats.fwd);
+            sss->stats.last_fwd = now;
             update_community_traffic(s, sl->len, now);
         }
         s->q_r = (s->q_r + 1) % SHAPER_SLOTS;
@@ -1730,6 +1792,7 @@ static int try_forward( n2n_sn_t * sss,
     if ( data_sent_len == pktsize )
     {
         ++(sss->stats.fwd);
+        sss->stats.last_fwd = now;
         if (cs) update_community_traffic(cs, pktsize, now);
         traceEvent(TRACE_DEBUG, "unicast %lu to [%s] %s%s",
                    pktsize,
@@ -1848,6 +1911,25 @@ static int process_mgmt( n2n_sn_t * sss,
     /* Second pass: for each community, scan edges list directly - no malloc needed */
     uint32_t displayed_edges = 0;
     for (int i = 0; i < num_communities; i++) {
+        /* Mark communities that hold promoted edges (registered via a
+         * brother supernode's identity, not directly on this SN): the
+         * community name gets a "* " prepended ("*n2n"). */
+        int is_prom = 0;
+        for (int p = 0; p < PROMOTED_LIST_MAX && !is_prom; p++)
+            if (sss->promoted[p].seen != 0 &&
+                now - sss->promoted[p].seen <= PROMOTED_TTL &&
+                memcmp(sss->promoted[p].community, communities[i],
+                       sizeof(n2n_community_t)) == 0)
+                is_prom = 1;
+        char cname[N2N_COMMUNITY_SIZE + 3];
+        int cnamelen = 0;
+        while (cnamelen < N2N_COMMUNITY_SIZE && communities[i][cnamelen])
+            cnamelen++;
+        int off = 0;
+        if (is_prom) cname[off++] = '*';
+        memcpy(cname + off, communities[i], cnamelen);
+        off += cnamelen;
+        cname[off] = 0;
         /* Community name line with traffic stats on same line */
         if (sss->traffic_stats_enabled) {
             struct community_stats *cs = sss->comm_stats;
@@ -1868,16 +1950,17 @@ static int process_mgmt( n2n_sn_t * sss,
                 if (kbps > 0.0 || gb_30d >= 0.1) {
                     const char *arrow = (kbps >= 0.1) ? "--->" : "    ";
                     ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
-                                       "%-57.16s  %s %-7.1f  %-7.1f  %-10.1f\n",
-                                       communities[i], arrow, kbps, gb_24h, gb_30d);
+                                       "%s%*s  %s %-7.1f  %-7.1f  %-10.1f\n",
+                                       cname, (int)(57 - off), "", arrow,
+                                       kbps, gb_24h, gb_30d);
                 } else {
-                    ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%.16s\n", communities[i]);
+                    ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%s\n", cname);
                 }
             } else {
-                ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%.16s\n", communities[i]);
+                ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%s\n", cname);
             }
         } else {
-            ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%.16s\n", communities[i]);
+            ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%s\n", cname);
         }
         r = sendto(sss->mgmt_sock, resbuf, ressize, 0, sender_sock, sender_sock_len);
         if (r <= 0) return -1;
@@ -2062,8 +2145,8 @@ static int process_mgmt( n2n_sn_t * sss,
                        num_edges,
                        (unsigned int)sss->stats.reg_super_nak,
                        (unsigned int)sss->stats.errors,
-                       (long unsigned int)(now - sss->stats.last_reg_super),
-                       (long unsigned int)(now - sss->stats.last_fwd));
+                       (long unsigned int)(sss->stats.last_reg_super ? now - sss->stats.last_reg_super : 0),
+                       (long unsigned int)(sss->stats.last_fwd ? now - sss->stats.last_fwd : 0));
 
     const char* ip_support;
     if (sss->ipv4_available && sss->ipv6_available) {
@@ -2157,6 +2240,7 @@ static int try_broadcast( n2n_sn_t * sss,
             {
                 ++(sss->stats.broadcast);
                 ++bc_count;
+                sss->stats.last_fwd = now;
                 traceEvent(TRACE_DEBUG, "multicast %lu to %s %s%s",
                            pktsize,
                            sock_to_cstr( sockbuf, primary ),
@@ -2271,8 +2355,6 @@ static int process_udp( n2n_sn_t * sss,
         /* Fill community from sender's registration */
         memcpy( cmn.community, sender_peer->community_name, N2N_COMMUNITY_SIZE );
         sender_peer->compact_capable = 1;
-
-        sss->stats.last_fwd = now;
 
         unicast = (0 == is_multi_broadcast( compact_dstMac ));
 
@@ -2485,7 +2567,6 @@ static int process_udp( n2n_sn_t * sss,
         const uint8_t *                 rec_buf; /* either udp_buf or encbuf */
 
 
-        sss->stats.last_fwd=now;
         decode_PACKET( &pkt, &cmn, udp_buf, &rem, &idx );
 
         /* A legacy PACKET means at least one edge in this community is legacy.
@@ -2596,7 +2677,6 @@ static int process_udp( n2n_sn_t * sss,
         int                             unicast; /* non-zero if unicast */
         const uint8_t *                 rec_buf; /* either udp_buf or encbuf */
 
-        sss->stats.last_fwd=now;
         decode_REGISTER( &reg, &cmn, udp_buf, &rem, &idx );
 
         /* Update version/os_name in peer record from REGISTER packet */
@@ -2816,8 +2896,6 @@ static int process_udp( n2n_sn_t * sss,
 
         /* Edge requesting registration with us.  */
 
-        sss->stats.last_reg_super=now;
-        ++(sss->stats.reg_super);
         decode_REGISTER_SUPER( &reg, &cmn, udp_buf, &rem, &idx );
 
         /* Brother SN detection: sn1 -> sn2 periodic registration, carries sn1's current address. */
@@ -2885,6 +2963,11 @@ static int process_udp( n2n_sn_t * sss,
             return 0; /* brother registration does not need an ACK */
         }
 
+        /* Count only real edge registrations; brother heartbeats above
+         * return before this point so they never pollute last_reg/reg_sup. */
+        sss->stats.last_reg_super=now;
+        ++(sss->stats.reg_super);
+
         /* Black/white list: silently drop registration for denied
          * communities (no reply, so the SN stays hidden). brother_reg
          * above is exempt from this check. */
@@ -2895,7 +2978,12 @@ static int process_udp( n2n_sn_t * sss,
          * Brother-trusted source: if the edge arrives from a registered
          * brother sn1 (recently seen, sender matches its sock), the peer is
          * admitted without token verification. The edge carries no sn2
-         * token because the user only configured sn1's -T. */
+         * token because the user only configured sn1's -T.
+         * Ask-backup probes carry desired_sn1_mac; a match against the
+         * brother table proves the edge belongs to sn1 — record it in the
+         * promoted list and admit the probe (the probe itself is not
+         * registered). After the failover switch the real registration
+         * carries neither hint nor token and is admitted via the list. */
         if (sss->peer_token_set)
         {
             int brother_alive = (sss->last_brother_seen != 0) &&
@@ -2916,12 +3004,30 @@ static int process_udp( n2n_sn_t * sss,
                         from_brother = 1;
                 }
             }
-            if (!from_brother &&
+
+            int sn1_hint_ok = 0;
+            {
+                uint8_t hint_zero[6] = {0,0,0,0,0,0};
+                if (memcmp(reg.desired_sn1_mac, hint_zero, 6) != 0)
+                    for (int j = 0; j < MAX_BROTHER_SNS && !sn1_hint_ok; j++)
+                        if (memcmp(sss->brothers[j].mac, reg.desired_sn1_mac,
+                                   N2N_MAC_SIZE) == 0)
+                            sn1_hint_ok = 1;
+            }
+            if (sn1_hint_ok)
+                record_promoted( sss, reg.edgeMac, cmn.community, now );
+
+            struct promoted_peer *pe =
+                find_promoted( sss, reg.edgeMac, cmn.community, now );
+
+            if (!from_brother && !pe &&
                 memcmp(reg.auth.token, sss->peer_token.token, sss->peer_token.toksize) != 0)
             {
                 traceEvent(TRACE_WARNING, "Peer reg rejected: bad peer token");
                 return 0;
             }
+            if (pe)
+                pe->seen = now; /* registration keeps the entry alive */
         }
 
         cmn2.ttl = N2N_DEFAULT_TTL;
@@ -3043,8 +3149,16 @@ static int process_udp( n2n_sn_t * sss,
         /* QUERY_ONLY: edge is asking us (as the brother/query channel) for
          * sn1's current address via a one-shot probe. Answer with the ACK
          * (including the sn1 brother lookup) but do NOT register/persist
-         * this edge as a peer, so it never shows up in / clogs our table. */
+         * this edge as a peer, so it never shows up in / clogs our table.
+         * Registrations carrying an sn1 hint (ask_backup probe: sock or
+         * MAC) count as queries too — the probing edge still belongs to
+         * sn1 and is only promoted into the table when it really
+         * registers here after the failover switch. */
         int query_only = (reg.aflags & N2N_AFLAGS_QUERY_ONLY) ? 1 : 0;
+        if (!query_only &&
+            (reg.desired_sn1_sock.port != 0 ||
+             memcmp(reg.desired_sn1_mac, ask_zero, 6) != 0))
+            query_only = 1;
 
         const n2n_sock_t *local_sock_ptr = (reg.aflags & N2N_AFLAGS_LOCAL_SOCKET) ? &reg.local_sock : NULL;
         uint8_t local_sock_ena = (reg.aflags & N2N_AFLAGS_LOCAL_SOCKET) ? 1 : 0;
@@ -3752,18 +3866,30 @@ static int run_loop( n2n_sn_t * sss )
             }
         }
 
-        /* Drop brother entries that have not checked in for 5 minutes. */
+        /* Keep brother entries while any sn1 peer may still need them:
+         * the promoted list (edges registered through sn1's identity) is
+         * refreshed by every probe/registration, so its newest "seen" is
+         * the liveness signal. Once no sn1 peer has been active for an
+         * hour the entries are no longer needed and are dropped. The
+         * ask_backup lookup itself only trusts the address while
+         * brother_alive (180s) so stale entries stay harmless. */
         {
             static time_t last_brother_purge = 0;
             if (now - last_brother_purge >= 30)
             {
                 last_brother_purge = now;
+                time_t last_promoted = 0;
+                for (int i = 0; i < PROMOTED_LIST_MAX; i++)
+                    if (sss->promoted[i].seen > last_promoted)
+                        last_promoted = sss->promoted[i].seen;
+                int peers_idle = (last_promoted == 0) ||
+                                 ((now - last_promoted) > 3600);
                 uint8_t zero[6] = {0,0,0,0,0,0};
                 for (int j = 0; j < MAX_BROTHER_SNS; j++) {
                     n2n_brother_entry_t *bb = &sss->brothers[j];
                     if (memcmp(bb->mac, zero, 6) == 0) continue;
                     time_t last = bb->seen > bb->seen6 ? bb->seen : bb->seen6;
-                    if (last != 0 && (now - last) > 300) {
+                    if (peers_idle && last != 0 && (now - last) > 3600) {
                         traceEvent(TRACE_NORMAL, "Brother purge: %02X:%02X:%02X:%02X:%02X:%02X idle %lus",
                                    bb->mac[0], bb->mac[1], bb->mac[2],
                                    bb->mac[3], bb->mac[4], bb->mac[5],
