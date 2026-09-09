@@ -1887,12 +1887,27 @@ static int try_forward( n2n_sn_t * sss,
 
 /* ===================== peer-relay assignment ===================== */
 
-/* A peer is "legacy" when it does not report a version: old edges neither
- * use relay assignments nor accept R-forwarded frames whose UDP source is
- * not their supernode (pseudo-sn would be dropped). */
+/* A peer is "legacy" when it shows no sign of new-style code (version string
+ * or a reported NAT type): old edges neither use relay assignments nor accept
+ * R-forwarded frames whose UDP source is not their supernode (pseudo-sn would
+ * be dropped). The REGISTER_SUPER wire carries no version, so a reported NAT
+ * type is the reliable "new edge" proof — see the body for details. */
 static int peer_is_legacy( const struct peer_info * p )
 {
-    return ( p->version[0] == '\0' || strcmp( p->version, "unknown" ) == 0 );
+    /* A real version string proves a new-style edge. So does a reported NAT
+     * type: the REGISTER_SUPER wire has no version field, so the sn normally
+     * learns a peer's version only via forwarded P2P REGISTERs — which rarely
+     * happen for the pairs that need peer-relay (their direct punches fail).
+     * Old edges never sent the REGISTER_SUPER NAT aflags, so their nat_type
+     * on the sn is always UNKNOWN; hence any known nat_type is likewise proof
+     * of new code. A still-classifying new edge (nat UNKNOWN) stays on the
+     * plain sn relay until its first NAT report lands — conservative, and it
+     * heals itself within ~60s of classification. */
+    if ( p->version[0] != '\0' && strcmp( p->version, "unknown" ) != 0 )
+        return 0;
+    if ( p->nat_type != N2N_NAT_UNKNOWN )
+        return 0;
+    return 1;
 }
 
 /* Candidate score for the relay election. Refusers and WS-only edges are

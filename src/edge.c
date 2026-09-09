@@ -2852,12 +2852,28 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
 #define RELAY_RETRY_SECS  60
 #define RELAY_RT_TTL      300  /* R: how long a sender's inbound path is remembered */
 
-/* A peer is "legacy" when it does not report a version: old edges neither
- * use relay assignments nor accept R-forwarded frames whose UDP source is
- * not their supernode (pseudo-sn would be dropped). */
+/* A peer is "legacy" when it shows no sign of new-style code (version string
+ * or a reported NAT type): old peers neither use relay assignments nor accept
+ * R-forwarded frames whose UDP source is not their supernode (pseudo-sn would
+ * be dropped). See the body — either signal alone proves new code, since the
+ * relay-relevant wire messages carry no version but do carry NAT aflags. */
 static int peer_is_legacy( const struct peer_info * p )
 {
-    return ( p->version[0] == '\0' || strcmp( p->version, "unknown" ) == 0 );
+    /* A real version string proves a new-style peer. So does a reported NAT
+     * type: edges never carry a version on the wire they arrive by here. A
+     * destination we relay for (11) is learned via the sn's PEER_INFO push,
+     * whose version comes from the sn's REGISTER_SUPER record — and that
+     * message has NO version field, so it is always "unknown". What the sn
+     * DOES stamp into the push is the peer's NAT type (N2N_NAT_AFLAGS), which
+     * only new edges ever report. Hence: non-legacy = version present OR nat
+     * known. A peer with nat UNKNOWN (e.g. R's own still-classifying peer) is
+     * conservatively treated as legacy — the matching sn-side rule keeps
+     * these consistent. */
+    if ( p->version[0] != '\0' && strcmp( p->version, "unknown" ) != 0 )
+        return 0;
+    if ( p->nat_type != N2N_NAT_UNKNOWN )
+        return 0;
+    return 1;
 }
 
 /* Sender-role modes returned by relay_find_dest:
