@@ -2951,6 +2951,7 @@ static const struct option long_options[] = {
 #define RELAY_DEAD_SECS   15   /* a frame/path seen this recently is "fresh" */
 #define RELAY_RETRY_SECS  60   /* throttle: how often to talk to the supernode */
 #define RELAY_UPDATE_SECS 15   /* relaying observation window length */
+#define RELAY_LIFETIME    240  /* sn assignment validity; active paths extend on use */
 
 /* find_peer_by_sock wrapper accepting an n2n_sock_t (v4 or v6). */
 static struct peer_info * relay_peer_by_sock( n2n_edge_t * eee, const n2n_sock_t * s )
@@ -3329,10 +3330,24 @@ static void relay_periodic( n2n_edge_t * eee, time_t now )
     int i;
     for ( i = 0; i < N2N_EDGE_RELAY_MAX; i++ )
     {
-        if ( eee->relay_table[i].valid && now >= eee->relay_table[i].expires )
+        n2n_relay_entry_t * r = &eee->relay_table[i];
+        if ( !r->valid || now < r->expires ) continue;
+        /* An actively used path must not be reclaimed while it flows: keep the
+         * entry alive for the sender-role when the sn echoed usable and we are
+         * still receiving proof, and for the relay-role while it forwards. An
+         * idle entry is freed so the next sn assignment takes a fresh slot. */
+        if ( r->ready && r->last_via != 0 && ( now - r->last_via ) <= RELAY_DEAD_SECS )
         {
-            memset( &eee->relay_table[i], 0, sizeof( eee->relay_table[i] ) );
+            r->expires = now + RELAY_LIFETIME;
+            continue;
         }
+        if ( memcmp( r->relay_mac, eee->device.mac_addr, N2N_MAC_SIZE ) == 0 &&
+             r->last_forward > 0 && ( now - r->last_forward ) <= RELAY_DEAD_SECS )
+        {
+            r->expires = now + RELAY_LIFETIME;
+            continue;
+        }
+        memset( r, 0, sizeof( *r ) );
     }
     relay_report_roles( eee, now );
 }
