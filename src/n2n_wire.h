@@ -60,7 +60,8 @@ enum n2n_pc
     n2n_probe=9,                /* P2P hole-punch probe: edge->edge direct */
     n2n_probe_ack=10,           /* P2P hole-punch result: observed addr via supernode */
     n2n_peer_info=11,           /* Supernode pushes peer address to edge */
-    n2n_query_peer=12           /* Edge asks supernode for peer address */
+    n2n_query_peer=12,          /* Edge asks supernode for peer address */
+    n2n_relay_assign=13         /* Supernode assigns a peer relay for a dst MAC */
 };
 
 typedef enum n2n_pc n2n_pc_t;
@@ -166,11 +167,23 @@ typedef struct n2n_PACKET n2n_PACKET_t;
 
 /* Linked with n2n_register_super in n2n_pc_t. Only from edge to supernode. */
 #define N2N_AFLAGS_LOCAL_SOCKET   0x0001  /* local_sock field is valid */
+#define N2N_AFLAGS_NAT_CONE       0x0020  /* edge reports cone NAT (dual-sn reflection) */
+#define N2N_AFLAGS_NAT_SYMMETRIC  0x0040  /* edge reports symmetric NAT (dual-sn reflection) */
+#define N2N_AFLAGS_NAT_BOUNCE     0x0080  /* edge asks this sn for a NAT bounce test:
+                                             sn replies from an extra helper socket
+                                             (different source port, outbound-only)
+                                             with the 4-byte magic "N2NB" */
+#define N2N_AFLAGS_NAT_FULL_CONE  0x0100  /* edge reports full-cone NAT
+                                             (reserved: needs a never-contacted 3rd IP) */
+#define N2N_AFLAGS_NAT_RESTRICTED 0x0200  /* edge reports address-restricted cone NAT */
+#define N2N_AFLAGS_NAT_PORT_RESTRICT 0x0400 /* edge reports port-restricted NAT */
 #define N2N_AFLAGS_FORCE_PEER_INFO 0x0008  /* force supernode to push all peer info */
 #define N2N_AFLAGS_QUERY_ONLY     0x0010  /* REGISTER_SUPER is a one-shot query
-                                             (e.g. ask sn2 for sn1's current address):
-                                             supernode replies with an ACK but does
-                                             NOT register/persist this edge as a peer */
+                                              (e.g. ask sn2 for sn1's current address):
+                                              supernode replies with an ACK but does
+                                              NOT register/persist this edge as a peer */
+#define N2N_AFLAGS_RELAY_REFUSE   0x0800  /* edge refuses to act as peer relay */
+#define N2N_AFLAGS_RELAY_WILLING  0x1000  /* edge volunteers as preferred peer relay */
 
 struct n2n_REGISTER_SUPER
 {
@@ -456,6 +469,27 @@ size_t decode_QUERY_PEER( n2n_QUERY_PEER_t * pkt,
                           const n2n_common_t * cmn,
                           const uint8_t * base,
                           size_t * rem, size_t * idx );
+
+/* RELAY_ASSIGN: supernode -> edge, assign a relay edge for traffic to a
+ * destination MAC when direct P2P fails. Data plane decentralisation: the
+ * edge sends such packets to the relay edge (a supernode-elected peer)
+ * instead of the supernode. The relay itself forwards with pseudo-sn
+ * semantics and needs no per-assignment signalling. */
+typedef struct n2n_RELAY_ASSIGN {
+    n2n_mac_t   relay_mac;      /* relay edge's MAC */
+    n2n_sock_t  relay_sock;     /* relay edge's public IPv4 address */
+    n2n_mac_t   dst_mac;        /* traffic to this MAC goes via the relay */
+    uint16_t    lifetime;       /* assignment validity in seconds */
+} n2n_RELAY_ASSIGN_t;
+
+size_t encode_RELAY_ASSIGN( uint8_t * base, size_t * idx,
+                            const n2n_common_t * common,
+                            const n2n_RELAY_ASSIGN_t * pkt );
+
+size_t decode_RELAY_ASSIGN( n2n_RELAY_ASSIGN_t * pkt,
+                            const n2n_common_t * cmn,
+                            const uint8_t * base,
+                            size_t * rem, size_t * idx );
 
 /* Compact PACKET format (leading tag N2N_PKT_VERSION_COMPACT): ttl(1) + flags(2) + dstMac(6) + [sock] */
 ssize_t encode_compact_header( uint8_t * base,
