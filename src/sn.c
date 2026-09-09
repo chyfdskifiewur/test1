@@ -2189,22 +2189,15 @@ static void sn_relay_maybe_assign( n2n_sn_t * sss,
                 return;
             }
 
-            /* Each endpoint must also be able to RECEIVE R's direct frames.
-             * Even a full-cone R (endpoint-independent filter) sources its
-             * traffic to every destination from a per-destination mapping
-             * (observed live: sn knows R as :5344, peers see R as :7001).
-             * A port-restr / symmetric endpoint filters that unknown source
-             * port out, so R->endpoint can NEVER arrive; the B--R direct
-             * connection then never completes, yet the sender still switches
-             * R-only once A--R is fresh -> permanent blackhole. Same rule as
-             * the R election: full-cone / cone / addr-restr endpoints only
-             * (they accept any source port once they have sent to R's IP). */
-            if ( !n2n_relay_nat_ok( pa->nat_type ) ||
-                 !n2n_relay_nat_ok( pb->nat_type ) )
-            {
-                ra->assigned = 0;
-                return;
-            }
+            /* Endpoints 11/33 have NO NAT restriction. The old rule demanded
+             * both endpoints be NAT1/NAT2 (because the switch trigger was
+             * only "A--R direct confirmed", which a strict-NAT endpoint could
+             * blackhole). Now the sender only switches off the sn copy after
+             * REAL full-path evidence (received B's reply THROUGH R), which
+             * never blackholes -- a strict-NAT endpoint just keeps the sn path
+             * until (if ever) the A--R--B path proves itself end to end. Only
+             * the ELECTED relay R still must be NAT1/NAT2 (checked inside
+             * sn_relay_pick/sn_relay_score). */
         }
 
         R = sn_relay_pick( sss, cmn->community, ra->a, ra->b );
