@@ -2028,6 +2028,36 @@ static void sn_relay_send_assign( n2n_sn_t * sss,
                 (unsigned)lifetime );
 }
 
+/* Send a "ready" go-ahead to an endpoint: the confirmed relay C reported that
+ * it holds BOTH directs, so this endpoint may start testing the full A--R--B
+ * path before switching off the sn copy. from=the peer R's MAC, dst=the peer
+ * this endpoint should test against. */
+static void sn_relay_send_ready( n2n_sn_t * sss,
+                                 const n2n_common_t * cmn,
+                                 struct peer_info * to,
+                                 const n2n_mac_t R,
+                                 const n2n_mac_t from, /* A */
+                                 const n2n_mac_t dst ) /* B */
+{
+    n2n_common_t c2;
+    n2n_RELAY_READY_t m;
+    uint8_t buf[N2N_SN_PKTBUF_SIZE];
+    size_t idx = 0;
+
+    memcpy( &c2, cmn, sizeof( n2n_common_t ) );
+    c2.pc = n2n_relay_ready;
+    c2.flags = N2N_FLAGS_FROM_SUPERNODE;
+    c2.ttl = N2N_DEFAULT_TTL;
+
+    memset( &m, 0, sizeof( m ) );
+    memcpy( m.relay_mac, R, N2N_MAC_SIZE );
+    memcpy( m.src_mac, from, N2N_MAC_SIZE );
+    memcpy( m.dst_mac, dst, N2N_MAC_SIZE );
+
+    encode_RELAY_READY( buf, &idx, &c2, &m );
+    sn_send_to_peer( sss, to, buf, idx );
+}
+
 /* Push one edge's addresses to another edge as PEER_INFO so the recipient
  * starts its normal direct-registration (P2P hole punching) toward it.
  * Used to build the endpoint<->relay direct paths BEFORE any traffic is
@@ -2095,20 +2125,29 @@ static void sn_relay_notify( n2n_sn_t * sss,
                              uint16_t lifetime )
 {
     struct peer_info * edge = find_peer_by_mac( sss->edges, src );
+    struct peer_info * other = find_peer_by_mac( sss->edges, dst );
 
     if (!edge) return;
 
-    /* Sender role: traffic for dst goes via R. */
+    /* Sender role: traffic for src -> dst goes via R. */
     sn_relay_send_assign( sss, cmn, edge, R, dst, lifetime );
 
     /* R role: the relay learns it carries traffic for dst. */
     sn_relay_send_assign( sss, cmn, R, R, dst, lifetime );
 
-    /* Direct-connection setup: the endpoint punches toward R, R punches
-     * toward the endpoint. Both are plain PEER_INFO, so both sides run the
-     * ordinary simultaneous-registration machinery. */
-    sn_relay_push_peer( sss, cmn, edge, R );
-    sn_relay_push_peer( sss, cmn, R, edge );
+    /* Direct-connection setup: EVERY endpoint of the pair must punch toward R,
+     * and R must punch toward each of them. Only once R holds BOTH directs
+     * (src and dst in its known_peers) can it report readiness and the pair be
+     * offloaded. Pushing R to both endpoints means both A and B run the ordinary
+     * simultaneous-registration machinery to reach R — a half-open A<->R alone
+     * can never claim the path is usable. */
+    sn_relay_push_peer( sss, cmn, edge, R );   /* src learns R */
+    sn_relay_push_peer( sss, cmn, R, edge );   /* R learns src */
+    if ( other && memcmp( other->mac_addr, edge->mac_addr, N2N_MAC_SIZE ) != 0 )
+    {
+        sn_relay_push_peer( sss, cmn, other, R ); /* dst learns R */
+        sn_relay_push_peer( sss, cmn, R, other ); /* R learns dst */
+    }
 }
 
 /* Called before every unicast PACKET relay through the sn: if the two edges
@@ -2145,6 +2184,23 @@ static void sn_relay_maybe_assign( n2n_sn_t * sss,
             struct peer_info *pa = find_peer_by_mac( sss->edges, ra->a );
             struct peer_info *pb = find_peer_by_mac( sss->edges, ra->b );
             if ( !pa || !pb || peer_is_legacy( pa ) || peer_is_legacy( pb ) )
+            {
+                ra->assigned = 0;
+                return;
+            }
+
+            /* Each endpoint must also be able to RECEIVE R's direct frames.
+             * Even a full-cone R (endpoint-independent filter) sources its
+             * traffic to every destination from a per-destination mapping
+             * (observed live: sn knows R as :5344, peers see R as :7001).
+             * A port-restr / symmetric endpoint filters that unknown source
+             * port out, so R->endpoint can NEVER arrive; the B--R direct
+             * connection then never completes, yet the sender still switches
+             * R-only once A--R is fresh -> permanent blackhole. Same rule as
+             * the R election: full-cone / cone / addr-restr endpoints only
+             * (they accept any source port once they have sent to R's IP). */
+            if ( !n2n_relay_nat_ok( pa->nat_type ) ||
+                 !n2n_relay_nat_ok( pb->nat_type ) )
             {
                 ra->assigned = 0;
                 return;
@@ -3294,6 +3350,35 @@ static int process_udp( n2n_sn_t * sss,
     else if ( msg_type == MSG_TYPE_REGISTER_ACK )
     {
         traceEvent( TRACE_DEBUG, "Rx REGISTER_ACK (NOT IMPLEMENTED) Should not be via supernode" );
+    }
+    else if ( msg_type == n2n_relay_ready )
+    {
+        /* Edge->sn readiness report: the relay edge C says it already holds a
+         * direct with BOTH endpoints (src_mac=A, dst_mac=B) of a relay pair, so
+         * the assignment is real and offloadable. Verify the current assigned
+         * relay for that pair really is C, then tell A (and B) it may test the
+         * full A--R--B path. Only the elected C may report; anything else is
+         * ignored (cheap hijack guard). */
+        n2n_RELAY_READY_t rdy;
+        decode_RELAY_READY( &rdy, &cmn, udp_buf, &rem, &idx );
+
+        {
+            n2n_sn_relay_t * ra = sn_relay_find( sss, rdy.src_mac, rdy.dst_mac, n2n_now() );
+            struct peer_info * pa = find_peer_by_mac( sss->edges, rdy.src_mac );
+            struct peer_info * pb = find_peer_by_mac( sss->edges, rdy.dst_mac );
+
+            if ( ra && ra->assigned &&
+                 memcmp( ra->r, rdy.relay_mac, N2N_MAC_SIZE ) == 0 )
+            {
+                /* Confirm back to both endpoints (only if they are the real peers) */
+                if ( pa ) sn_relay_send_ready( sss, &cmn, pa, ra->r, rdy.src_mac, rdy.dst_mac );
+                if ( pb ) sn_relay_send_ready( sss, &cmn, pb, ra->r, rdy.src_mac, rdy.dst_mac );
+                traceEvent( TRACE_INFO, "relay ready confirmed: %s<->%s via %s",
+                            macaddr_str( mac_buf, rdy.src_mac ),
+                            macaddr_str( mac_buf2, rdy.dst_mac ),
+                            macaddr_str( mac_buf3, rdy.relay_mac ) );
+            }
+        }
     }
     else if ( msg_type == n2n_deregister )
     {

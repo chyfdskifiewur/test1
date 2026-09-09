@@ -912,3 +912,28 @@ size_t decode_RELAY_ASSIGN( n2n_RELAY_ASSIGN_t * pkt,
     retval += decode_uint16( &pkt->lifetime, base, rem, idx );
     return retval;
 }
+
+size_t encode_RELAY_READY( uint8_t * base, size_t * idx,
+                           const n2n_common_t * common,
+                           const n2n_RELAY_READY_t * pkt )
+{
+    size_t retval = 0;
+    retval += encode_common( base, idx, common );
+    retval += encode_mac( base, idx, pkt->relay_mac );
+    retval += encode_mac( base, idx, pkt->src_mac );
+    retval += encode_mac( base, idx, pkt->dst_mac );
+    return retval;
+}
+
+size_t decode_RELAY_READY( n2n_RELAY_READY_t * pkt,
+                           const n2n_common_t * cmn,
+                           const uint8_t * base,
+                           size_t * rem, size_t * idx )
+{
+    size_t retval = 0;
+    memset( pkt, 0, sizeof(*pkt) );
+    retval += decode_mac( pkt->relay_mac, base, rem, idx );
+    retval += decode_mac( pkt->src_mac, base, rem, idx );
+    retval += decode_mac( pkt->dst_mac, base, rem, idx );
+    return retval;
+}

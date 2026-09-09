@@ -61,7 +61,16 @@ enum n2n_pc
     n2n_probe_ack=10,           /* P2P hole-punch result: observed addr via supernode */
     n2n_peer_info=11,           /* Supernode pushes peer address to edge */
     n2n_query_peer=12,          /* Edge asks supernode for peer address */
-    n2n_relay_assign=13         /* Supernode assigns a peer relay for a dst MAC */
+    n2n_relay_assign=13,        /* Supernode assigns a peer relay for a dst MAC */
+    n2n_relay_ready=14          /* Relay edge (R) confirms both directs are up; sn
+                                 * relays the "usable" notice to the sender so it
+                                 * tests the A--R--B path BEFORE switching off the
+                                 * sn copy. Two roles on one packet type:
+                                 *   edge->sn : R reports "I already hold R<->A and
+                                 *               R<->B; the pair is offloadable";
+                                 *   sn->edge : the sn confirms the assignment is
+                                 *               still valid and the sender may
+                                 *               begin testing via R. */
 };
 
 typedef enum n2n_pc n2n_pc_t;
@@ -490,6 +499,26 @@ size_t decode_RELAY_ASSIGN( n2n_RELAY_ASSIGN_t * pkt,
                             const n2n_common_t * cmn,
                             const uint8_t * base,
                             size_t * rem, size_t * idx );
+
+/* RELAY_READY: "the relay edge holds BOTH directs (R<->A and R<->B), so the
+ * pair is offloadable". Sent C->sn by the relay edge once it confirms both
+ * endpoints are directly reachable, and sn->A/B as the "usable" go-ahead.
+ * Fields identify the relay edge and the ATTACHED endpoint (the other endpoint
+ * of the pair is implicit from the direction / the relay assignment). */
+typedef struct n2n_RELAY_READY {
+    n2n_mac_t   relay_mac;      /* relay edge's MAC */
+    n2n_mac_t   src_mac;        /* C->sn: peer R holds a direct with; sn->A: A */
+    n2n_mac_t   dst_mac;        /* the other endpoint of the relay pair */
+} n2n_RELAY_READY_t;
+
+size_t encode_RELAY_READY( uint8_t * base, size_t * idx,
+                           const n2n_common_t * common,
+                           const n2n_RELAY_READY_t * pkt );
+
+size_t decode_RELAY_READY( n2n_RELAY_READY_t * pkt,
+                           const n2n_common_t * cmn,
+                           const uint8_t * base,
+                           size_t * rem, size_t * idx );
 
 /* Compact PACKET format (leading tag N2N_PKT_VERSION_COMPACT): ttl(1) + flags(2) + dstMac(6) + [sock] */
 ssize_t encode_compact_header( uint8_t * base,

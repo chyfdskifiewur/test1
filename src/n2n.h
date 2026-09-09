@@ -325,7 +325,10 @@ typedef struct n2n_relay_entry {
     n2n_mac_t   relay_mac;      /* relay edge's MAC; own MAC = we are R */
     n2n_sock_t  relay_sock;     /* relay edge's public IPv4 address */
     time_t      expires;        /* assignment validity ("observation period") */
-    time_t      last_via;       /* last packet seen from relay_sock (0=never) */
+    uint8_t     ready;          /* sn confirmed the full A--R--B path usable */
+    time_t      last_ready_report; /* R side: throttle of reporting readiness */
+    time_t      last_via;       /* last full-path frame received via the relay
+                                 * whose src matched this entry's dst_mac */
     time_t      last_try;       /* last packet sent to the relay (retry pacing) */
 } n2n_relay_entry_t;
 
