@@ -838,7 +838,7 @@ static void help() {
     printf("-T <token>               | Supernode registration token (ASCII, max 32).\n");
     printf("-v                       | Make more verbose. Repeat as required.\n");
     printf("-w                       | WebSocket mode: relay via supernode over WS (TCP), disable P2P.\n");
-    printf("-Z <0|1|2>                | Peer relay willingness: 0=refuse, 1=auto (default), 2=willing.\n");
+    printf("-Z <0|1|2>               | Peer relay willingness: 0 = refuse, 1 = auto (default), 2 = willing.\n");
     printf("-h                       | Show this help message.\n");
 
     printf("\nEnvironment variables:\n");
@@ -3217,8 +3217,12 @@ static int relay_forward( n2n_edge_t * eee, const n2n_common_t * cmn,
     uint8_t buf[N2N_PKT_BUF_SIZE];
     size_t idx = 0;
 
+    /* The relay role reads/writes relay_table, relay_rt and known_peers that the
+     * TAP thread also touches under PEERS_LOCK (send_PACKET), so these are done
+     * under the same lock to stay race-free on Windows' two-thread model. */
+    PEERS_LOCK( eee );
     role = relay_find_role( eee, pkt->dstMac, now );
-    if ( !role ) return 0;
+    if ( !role ) { PEERS_UNLOCK( eee ); return 0; }
 
     /* Remember the source endpoint's inbound socket so replies return to it.
      * The source of a relayed frame is the transport sender, not a fixed sn. */
@@ -3232,10 +3236,10 @@ static int relay_forward( n2n_edge_t * eee, const n2n_common_t * cmn,
     {
         struct peer_info * dp = find_peer_by_mac( eee->known_peers, pkt->dstMac );
         if ( dp && dp->sock.family != 0 ) tgt = dp->sock;
-        else return 1;
+        else { PEERS_UNLOCK( eee ); return 1; }
     }
 
-    if ( cmn->ttl <= 1 ) return 1; /* guard: never loop */
+    if ( cmn->ttl <= 1 ) { PEERS_UNLOCK( eee ); return 1; } /* guard: never loop */
 
     /* Rebuild a legacy PACKET header (the relay's name appears nowhere on the
      * wire, only as the transport source). FROM_SUPERNODE + virtual origin let
@@ -3261,6 +3265,7 @@ static int relay_forward( n2n_edge_t * eee, const n2n_common_t * cmn,
     }
 
     role->last_forward = now;
+    PEERS_UNLOCK( eee );
     return 1;
 }
 
@@ -3274,6 +3279,9 @@ static void handle_relay_assign( n2n_edge_t * eee, const n2n_RELAY_ASSIGN_t * a,
     int i, free_slot = -1;
     uint16_t lifetime = a->lifetime ? a->lifetime : 240;
 
+    /* relay_table is also read by the TAP thread under PEERS_LOCK
+     * (send_PACKET), so writes here take the same lock. */
+    PEERS_LOCK( eee );
     for ( i = 0; i < N2N_EDGE_RELAY_MAX; i++ )
     {
         if ( !eee->relay_table[i].valid ) { if ( free_slot < 0 ) free_slot = i; continue; }
@@ -3285,7 +3293,7 @@ static void handle_relay_assign( n2n_edge_t * eee, const n2n_RELAY_ASSIGN_t * a,
     }
     if ( !r )
     {
-        if ( free_slot < 0 ) return;
+        if ( free_slot < 0 ) { PEERS_UNLOCK( eee ); return; }
         r = &eee->relay_table[free_slot];
         memset( r, 0, sizeof(*r) );
         r->valid = 1;
@@ -3305,6 +3313,7 @@ static void handle_relay_assign( n2n_edge_t * eee, const n2n_RELAY_ASSIGN_t * a,
     r->obs_start = now;
     r->last_forward = 0;
     r->last_ready_report = 0;
+    PEERS_UNLOCK( eee );
 }
 
 /* Supernode echoes the relay's "feasible" verdict to the endpoints. A "yes"
@@ -3312,6 +3321,7 @@ static void handle_relay_assign( n2n_edge_t * eee, const n2n_RELAY_ASSIGN_t * a,
 static void handle_relay_ready( n2n_edge_t * eee, const n2n_RELAY_READY_t * m, time_t now )
 {
     int i;
+    PEERS_LOCK( eee );
     for ( i = 0; i < N2N_EDGE_RELAY_MAX; i++ )
     {
         n2n_relay_entry_t * r = &eee->relay_table[i];
@@ -3322,6 +3332,7 @@ static void handle_relay_ready( n2n_edge_t * eee, const n2n_RELAY_READY_t * m, t
         r->ready = m->feasible ? 1 : 0;
         if ( !m->feasible ) r->last_via = 0;
     }
+    PEERS_UNLOCK( eee );
 }
 
 /* Periodic sweep: drop expired entries and, for relay-role entries, run the
@@ -3329,6 +3340,10 @@ static void handle_relay_ready( n2n_edge_t * eee, const n2n_RELAY_READY_t * m, t
 static void relay_periodic( n2n_edge_t * eee, time_t now )
 {
     int i;
+    /* relay_table is shared with the TAP thread (send_PACKET) on Windows;
+     * keep the sweep + role reporter under one lock. relay_report_roles does
+     * not lock itself. */
+    PEERS_LOCK( eee );
     for ( i = 0; i < N2N_EDGE_RELAY_MAX; i++ )
     {
         n2n_relay_entry_t * r = &eee->relay_table[i];
@@ -3351,6 +3366,7 @@ static void relay_periodic( n2n_edge_t * eee, time_t now )
         memset( r, 0, sizeof( *r ) );
     }
     relay_report_roles( eee, now );
+    PEERS_UNLOCK( eee );
 }
 
 /** Send an ecapsulated ethernet PACKET to a destination edge or broadcast MAC
