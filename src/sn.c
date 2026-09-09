@@ -685,15 +685,22 @@ struct promoted_peer {
     time_t          seen;    /* last probe/registration time (0 = free slot) */
 };
 
-/* Peer-relay assignment record: one per relayed a<->b edge pair ("R" is
- * the elected relay edge; see sn_relay_maybe_assign). */
-typedef struct n2n_sn_relay {
-    uint8_t     used;
-    n2n_mac_t   a, b, r;   /* the two endpoints and the relay edge */
-    time_t      assigned;  /* when R was picked */
-    time_t      last_used; /* last relayed packet seen (lazy expiry) */
-    time_t      last_notified_a, last_notified_b;
-} n2n_sn_relay_t;
+/* Per-pair relay record the supernode keeps. A "pair" is two group members
+ * whose traffic is being (or might be) carried by a third, chosen member. */
+typedef struct sn_relay_entry {
+    uint8_t     valid;             /* slot in use */
+    uint8_t     done;              /* every candidate failed: the sn serves this pair */
+    n2n_mac_t   e1, e2;            /* the endpoint mac pair (unordered) */
+    struct peer_info * r;          /* currently chosen relay, or NULL */
+    uint8_t     feasible;          /* last reported answer (0=no, 1=yes) */
+    n2n_sock_t  r_public;          /* chosen relay's public sock at assignment time */
+    time_t      assigned;          /* when the current relay was (re)assigned */
+    time_t      last_used;         /* last traffic seen for this pair (lazy reclaim) */
+    time_t      notify_sent;       /* per-direction notify throttle */
+    uint8_t     unavailable_count; /* how many "cannot relay" answers remembered */
+    n2n_mac_t   unavailable[N2N_SN_CANDIDATE_MAX]; /* member macs that said "cannot" */
+    time_t      unavailable_at[N2N_SN_CANDIDATE_MAX]; /* when each answer was given */
+} sn_relay_entry_t;
 
 struct n2n_sn
 {
@@ -739,18 +746,7 @@ struct n2n_sn
 #define FC_PROBE_MAX 16
 #define FC_PROBE_SPREAD 2   /* seconds between the 3 sends */
     struct { n2n_sock_t target; time_t due; uint8_t left; } fc_probes[FC_PROBE_MAX];
-
-    /* Peer-relay assignments: src<->dst MAC pair -> relay edge ("R").
-     * Created lazily when relayed unicast data flows between two edges;
-     * willing edges (-Z2) are preferred over auto-consent (-Z1). R is
-     * sticky until it disappears from the edge table; endpoints then fall
-     * back to the sn relay immediately and the next relayed packet elects
-     * a replacement. N2N_SN_RELAY_TTL is only the lazy-expiry time for a
-     * pair entry without traffic. */
-#define N2N_SN_RELAY_MAX      32
-#define N2N_SN_RELAY_TTL      300  /* pair-entry lazy expiry without traffic */
-#define N2N_SN_RELAY_REFRESH  60   /* min interval between re-notifies per direction */
-    n2n_sn_relay_t relays[N2N_SN_RELAY_MAX];
+    sn_relay_entry_t    relays[N2N_SN_RELAY_MAX]; /* peer-relay pair records */
 };
 
 typedef struct n2n_sn n2n_sn_t;
@@ -992,7 +988,6 @@ static int update_edge( n2n_sn_t * sss,
                         const char * version,
                         const char * os_name,
                         uint8_t nat_type,
-                        uint8_t relay_mode, /* peer-relay willingness (0/1/2) */
                         uint8_t request_ip,
                         uint32_t requested_ip );
 
@@ -1183,7 +1178,6 @@ static int update_edge( n2n_sn_t * sss,
                         const char * version,
                         const char * os_name,
                         uint8_t nat_type,
-                        uint8_t relay_mode, /* peer-relay willingness (0/1/2) */
                         uint8_t request_ip,
                         uint32_t requested_ip )
 {
@@ -1359,7 +1353,6 @@ static int update_edge( n2n_sn_t * sss,
             strcpy(scan->os_name, "unknown");
         }
         scan->nat_type = nat_type;
-        scan->relay_mode = relay_mode;
 
         /* insert this guy at the head of the edges list */
         scan->next = sss->edges;
@@ -1423,7 +1416,6 @@ static int update_edge( n2n_sn_t * sss,
             }
             scan->nat_type = nat_type;
         }
-        scan->relay_mode = relay_mode;
 
         /* Update assigned IP if edge requests a different valid IP */
         if (request_ip && requested_ip != 0) {
@@ -1885,340 +1877,6 @@ static int try_forward( n2n_sn_t * sss,
     return 0;
 }
 
-/* ===================== peer-relay assignment ===================== */
-
-/* A peer is "legacy" when it shows no sign of new-style code (version string
- * or a reported NAT type): old edges neither use relay assignments nor accept
- * R-forwarded frames whose UDP source is not their supernode (pseudo-sn would
- * be dropped). The REGISTER_SUPER wire carries no version, so a reported NAT
- * type is the reliable "new edge" proof — see the body for details. */
-static int peer_is_legacy( const struct peer_info * p )
-{
-    /* A real version string proves a new-style edge. So does a reported NAT
-     * type: the REGISTER_SUPER wire has no version field, so the sn normally
-     * learns a peer's version only via forwarded P2P REGISTERs — which rarely
-     * happen for the pairs that need peer-relay (their direct punches fail).
-     * Old edges never sent the REGISTER_SUPER NAT aflags, so their nat_type
-     * on the sn is always UNKNOWN; hence any known nat_type is likewise proof
-     * of new code. A still-classifying new edge (nat UNKNOWN) stays on the
-     * plain sn relay until its first NAT report lands — conservative, and it
-     * heals itself within ~60s of classification. */
-    if ( p->version[0] != '\0' && strcmp( p->version, "unknown" ) != 0 )
-        return 0;
-    if ( p->nat_type != N2N_NAT_UNKNOWN )
-        return 0;
-    return 1;
-}
-
-/* Candidate score for the relay election. Refusers and WS-only edges are
- * excluded, so are all NAT types outside NAT1/NAT2 (see n2n_relay_nat_ok
- * in n2n.h): a port-restr relay cannot form a direct connection with
- * symmetric endpoints and unknown is unmeasured — the sn silently ignores
- * them; the edge's mgmt window tells the user why. Willing edges beat
- * auto-consent edges; among equals the better NAT wins. Ties are broken
- * randomly (reservoir sampling). */
-static int sn_relay_score( const struct peer_info * p,
-                           const n2n_mac_t a,
-                           const n2n_mac_t b )
-{
-    if (p->relay_mode == 0) return 0;               /* refused */
-    if (p->ws) return 0;                            /* WS edges keep the sn path */
-    if (p->sock.family != AF_INET) return 0;        /* relay path is IPv4-only */
-    if (!n2n_relay_nat_ok( p->nat_type )) return 0; /* NAT1/NAT2 only */
-    if (memcmp(p->mac_addr, a, N2N_MAC_SIZE) == 0 ||
-        memcmp(p->mac_addr, b, N2N_MAC_SIZE) == 0) return 0;
-    {
-        int nat_rank = (p->nat_type == N2N_NAT_FULL_CONE) ? 4 : 3;
-        return nat_rank + (p->relay_mode == 2 ? 8 : 0);
-    }
-}
-
-/* Pick the best relay edge for the a<->b pair (random among top scorers). */
-static struct peer_info * sn_relay_pick( n2n_sn_t * sss,
-                                         const n2n_community_t community,
-                                         const n2n_mac_t a,
-                                         const n2n_mac_t b )
-{
-    struct peer_info *scan, *chosen = NULL;
-    int best = 0, count = 0;
-
-    for (scan = sss->edges; scan; scan = scan->next) {
-        int s;
-        if (memcmp(scan->community_name, community, sizeof(n2n_community_t)) != 0)
-            continue;
-        s = sn_relay_score(scan, a, b);
-        if (s > best) best = s;
-    }
-    if (best == 0) return NULL;
-
-    for (scan = sss->edges; scan; scan = scan->next) {
-        if (memcmp(scan->community_name, community, sizeof(n2n_community_t)) != 0)
-            continue;
-        if (sn_relay_score(scan, a, b) != best) continue;
-        if (++count == 1 || (rand() % count) == 0)
-            chosen = scan;
-    }
-    return chosen;
-}
-
-/* Find (or lazily create) the assignment entry for the a<->b pair. */
-static n2n_sn_relay_t * sn_relay_find( n2n_sn_t * sss,
-                                       const n2n_mac_t a, const n2n_mac_t b,
-                                       time_t now )
-{
-    int i, free_i = -1, oldest_i = -1;
-    n2n_sn_relay_t * slots = sss->relays;
-
-    for (i = 0; i < N2N_SN_RELAY_MAX; i++) {
-        if (slots[i].used && (now - slots[i].last_used) > N2N_SN_RELAY_TTL)
-            slots[i].used = 0; /* expired: no relayed traffic recently */
-        if (slots[i].used &&
-            ((memcmp(slots[i].a, a, N2N_MAC_SIZE) == 0 && memcmp(slots[i].b, b, N2N_MAC_SIZE) == 0) ||
-             (memcmp(slots[i].a, b, N2N_MAC_SIZE) == 0 && memcmp(slots[i].b, a, N2N_MAC_SIZE) == 0)))
-            return &slots[i];
-        if (!slots[i].used && free_i < 0) free_i = i;
-        if (slots[i].used && (oldest_i < 0 || slots[i].last_used < slots[oldest_i].last_used))
-            oldest_i = i;
-    }
-    {
-        int t = (free_i >= 0) ? free_i : oldest_i;
-        if (t < 0) return NULL; /* table full */
-        memset(&slots[t], 0, sizeof(slots[t]));
-        slots[t].used = 1;
-        memcpy(slots[t].a, a, N2N_MAC_SIZE);
-        memcpy(slots[t].b, b, N2N_MAC_SIZE);
-        return &slots[t];
-    }
-}
-
-/* Send one RELAY_ASSIGN datagram to 'to'. When 'to' is the relay itself the
- * entry reads "you forward traffic for dst_mac"; otherwise it reads
- * "traffic for dst_mac goes via R". */
-static void sn_relay_send_assign( n2n_sn_t * sss,
-                                  const n2n_common_t * cmn,
-                                  struct peer_info * to,
-                                  struct peer_info * R,
-                                  const n2n_mac_t dst,
-                                  uint16_t lifetime )
-{
-    n2n_common_t c2;
-    n2n_RELAY_ASSIGN_t m;
-    uint8_t buf[N2N_SN_PKTBUF_SIZE];
-    size_t idx = 0;
-    macstr_t mac_buf, mac_buf2, mac_buf3;
-
-    memcpy( &c2, cmn, sizeof( n2n_common_t ) );
-    c2.pc = n2n_relay_assign;
-    c2.flags = N2N_FLAGS_FROM_SUPERNODE;
-    c2.ttl = N2N_DEFAULT_TTL;
-
-    memset( &m, 0, sizeof( m ) );
-    memcpy( m.relay_mac, R->mac_addr, N2N_MAC_SIZE );
-    m.relay_sock = R->sock; /* AF_INET checked by sn_relay_score */
-    memcpy( m.dst_mac, dst, N2N_MAC_SIZE );
-    m.lifetime = lifetime;
-
-    encode_RELAY_ASSIGN( buf, &idx, &c2, &m );
-    sn_send_to_peer( sss, to, buf, idx );
-
-    traceEvent( TRACE_INFO, "relay assigned: %s -> %s via %s (ttl %us)",
-                macaddr_str( mac_buf, to->mac_addr ),
-                macaddr_str( mac_buf2, dst ),
-                macaddr_str( mac_buf3, R->mac_addr ),
-                (unsigned)lifetime );
-}
-
-/* Send a "ready" go-ahead to an endpoint: the confirmed relay C reported that
- * it holds BOTH directs, so this endpoint may start testing the full A--R--B
- * path before switching off the sn copy. from=the peer R's MAC, dst=the peer
- * this endpoint should test against. */
-static void sn_relay_send_ready( n2n_sn_t * sss,
-                                 const n2n_common_t * cmn,
-                                 struct peer_info * to,
-                                 const n2n_mac_t R,
-                                 const n2n_mac_t from, /* A */
-                                 const n2n_mac_t dst ) /* B */
-{
-    n2n_common_t c2;
-    n2n_RELAY_READY_t m;
-    uint8_t buf[N2N_SN_PKTBUF_SIZE];
-    size_t idx = 0;
-
-    memcpy( &c2, cmn, sizeof( n2n_common_t ) );
-    c2.pc = n2n_relay_ready;
-    c2.flags = N2N_FLAGS_FROM_SUPERNODE;
-    c2.ttl = N2N_DEFAULT_TTL;
-
-    memset( &m, 0, sizeof( m ) );
-    memcpy( m.relay_mac, R, N2N_MAC_SIZE );
-    memcpy( m.src_mac, from, N2N_MAC_SIZE );
-    memcpy( m.dst_mac, dst, N2N_MAC_SIZE );
-
-    encode_RELAY_READY( buf, &idx, &c2, &m );
-    sn_send_to_peer( sss, to, buf, idx );
-}
-
-/* Push one edge's addresses to another edge as PEER_INFO so the recipient
- * starts its normal direct-registration (P2P hole punching) toward it.
- * Used to build the endpoint<->relay direct paths BEFORE any traffic is
- * allowed to switch to the relay: blind probing only works when R happens
- * to be full-cone, a direct connection works for every R NAT type. */
-static void sn_relay_push_peer( n2n_sn_t * sss,
-                                const n2n_common_t * cmn,
-                                struct peer_info * to,
-                                struct peer_info * about )
-{
-    n2n_common_t    pi_cmn;
-    n2n_PEER_INFO_t pi;
-    uint8_t         pibuf[N2N_SN_PKTBUF_SIZE];
-    size_t          pix;
-
-    memset(&pi_cmn, 0, sizeof(pi_cmn));
-    memset(&pi, 0, sizeof(pi));
-    pi_cmn.ttl   = N2N_DEFAULT_TTL;
-    pi_cmn.pc    = n2n_peer_info;
-    pi_cmn.flags = N2N_FLAGS_FROM_SUPERNODE;
-    memcpy(pi_cmn.community, cmn->community, sizeof(n2n_community_t));
-
-    memcpy(pi.mac, about->mac_addr, N2N_MAC_SIZE);
-    /* Always put IPv4 in sockets[0] if available */
-    if (about->sock.family == AF_INET)
-        pi.sockets[0] = about->sock;
-    else if (about->sock6.family == AF_INET6)
-        pi.sockets[0] = about->sock6;
-    if (about->num_sockets > 1 &&
-        about->sockets[1].family != 0 &&
-        about->sockets[1].port != 0)
-    {
-        pi.aflags = N2N_AFLAGS_LOCAL_SOCKET;
-        pi.sockets[1] = about->sockets[1];
-    } else {
-        pi.aflags = 0;
-    }
-    if (about->sock6.family == AF_INET6) {
-        pi.aflags |= N2N_AFLAGS_IPV6_SOCKET;
-        pi.sock6 = about->sock6;
-    } else {
-        memset(&pi.sock6, 0, sizeof(n2n_sock_t));
-    }
-    if (about->same_lan_as_sn) {
-        pi.aflags |= N2N_AFLAGS_SAME_LAN_AS_SN;
-    }
-    strncpy(pi.version, about->version, sizeof(pi.version) - 1);
-    strncpy(pi.os_name, about->os_name, sizeof(pi.os_name) - 1);
-    pi.assigned_ip = about->assigned_ip;
-    pi.aflags |= N2N_NAT_AFLAGS(about->nat_type);
-    pix = 0;
-    encode_PEER_INFO(pibuf, &pix, &pi_cmn, &pi);
-    sn_send_to_peer( sss, to, pibuf, pix );
-}
-
-/* Send a RELAY_ASSIGN to the sending endpoint AND to the relay itself, plus
- * the PEER_INFO pushes that let endpoint<->relay direct connections form.
- * The relay needs one entry per direction: {dst=dst} comes with this call
- * (sender A traffic), the reverse {dst=a} entry is taught the same way when
- * B's traffic triggers its own notify — so no extra refresh bookkeeping. */
-static void sn_relay_notify( n2n_sn_t * sss,
-                             const n2n_common_t * cmn,
-                             const n2n_mac_t src, const n2n_mac_t dst,
-                             struct peer_info * R,
-                             uint16_t lifetime )
-{
-    struct peer_info * edge = find_peer_by_mac( sss->edges, src );
-    struct peer_info * other = find_peer_by_mac( sss->edges, dst );
-
-    if (!edge) return;
-
-    /* Sender role: traffic for src -> dst goes via R. */
-    sn_relay_send_assign( sss, cmn, edge, R, dst, lifetime );
-
-    /* R role: the relay learns it carries traffic for dst. */
-    sn_relay_send_assign( sss, cmn, R, R, dst, lifetime );
-
-    /* Direct-connection setup: EVERY endpoint of the pair must punch toward R,
-     * and R must punch toward each of them. Only once R holds BOTH directs
-     * (src and dst in its known_peers) can it report readiness and the pair be
-     * offloaded. Pushing R to both endpoints means both A and B run the ordinary
-     * simultaneous-registration machinery to reach R — a half-open A<->R alone
-     * can never claim the path is usable. */
-    sn_relay_push_peer( sss, cmn, edge, R );   /* src learns R */
-    sn_relay_push_peer( sss, cmn, R, edge );   /* R learns src */
-    if ( other && memcmp( other->mac_addr, edge->mac_addr, N2N_MAC_SIZE ) != 0 )
-    {
-        sn_relay_push_peer( sss, cmn, other, R ); /* dst learns R */
-        sn_relay_push_peer( sss, cmn, R, other ); /* R learns dst */
-    }
-}
-
-/* Called before every unicast PACKET relay through the sn: if the two edges
- * keep exchanging relayed traffic, elect a relay edge ("R") and tell the
- * sender and R itself. The receiver learns R the same way on its own reply
- * traffic. R is sticky by design (stability): it is only re-elected when it
- * disappears from the edge table — no periodic re-election. R disappears ->
- * the endpoints' direct connection to it dies, they drop straight back to
- * the sn relay, and the replacement gets elected on the next relayed packet. */
-static void sn_relay_maybe_assign( n2n_sn_t * sss,
-                                   const n2n_common_t * cmn,
-                                   const n2n_mac_t src, const n2n_mac_t dst,
-                                   time_t now )
-{
-    n2n_sn_relay_t *ra;
-    struct peer_info *R;
-    time_t *last_notified;
-
-    ra = sn_relay_find( sss, src, dst, now );
-    if ( !ra ) return;
-    ra->last_used = now;
-
-    /* Elect R once, then keep it (sticky): re-elect only when the entry is
-     * brand new or R vanished from the edge table. No TTL-based re-election
-     * — switching R costs a fresh direct-connection setup and traffic
-     * churn, which outweighs a marginal score improvement. */
-    if ( ra->assigned == 0 || !find_peer_by_mac( sss->edges, ra->r ) )
-    {
-        /* Peer-relay needs BOTH endpoints on new-style code: a legacy edge
-         * never consults assignments (sender role) and drops R-forwarded
-         * frames from a non-sn source (destination role). Stay on the plain
-         * sn relay for such pairs. */
-        {
-            struct peer_info *pa = find_peer_by_mac( sss->edges, ra->a );
-            struct peer_info *pb = find_peer_by_mac( sss->edges, ra->b );
-            if ( !pa || !pb || peer_is_legacy( pa ) || peer_is_legacy( pb ) )
-            {
-                ra->assigned = 0;
-                return;
-            }
-
-            /* Endpoints 11/33 have NO NAT restriction. The old rule demanded
-             * both endpoints be NAT1/NAT2 (because the switch trigger was
-             * only "A--R direct confirmed", which a strict-NAT endpoint could
-             * blackhole). Now the sender only switches off the sn copy after
-             * REAL full-path evidence (received B's reply THROUGH R), which
-             * never blackholes -- a strict-NAT endpoint just keeps the sn path
-             * until (if ever) the A--R--B path proves itself end to end. Only
-             * the ELECTED relay R still must be NAT1/NAT2 (checked inside
-             * sn_relay_pick/sn_relay_score). */
-        }
-
-        R = sn_relay_pick( sss, cmn->community, ra->a, ra->b );
-        if ( !R ) { ra->assigned = 0; return; } /* no candidate: stay on sn relay */
-        memcpy( ra->r, R->mac_addr, N2N_MAC_SIZE );
-        ra->assigned = now;
-        ra->last_notified_a = ra->last_notified_b = 0;
-    }
-
-    R = find_peer_by_mac( sss->edges, ra->r );
-    if ( !R ) { ra->assigned = 0; return; }
-
-    last_notified = ( memcmp( src, ra->a, N2N_MAC_SIZE ) == 0 )
-                    ? &ra->last_notified_a : &ra->last_notified_b;
-    if ( (now - *last_notified) >= N2N_SN_RELAY_REFRESH )
-    {
-        sn_relay_notify( sss, cmn, src, dst, R,
-                         N2N_SN_RELAY_TTL - N2N_SN_RELAY_REFRESH );
-        *last_notified = now;
-    }
-}
 
 /** Try and broadcast a message to all edges in the community.
  *
@@ -3125,10 +2783,6 @@ static int process_udp( n2n_sn_t * sss,
 
         if ( unicast )
         {
-            /* Relay election: keep assigning a relay edge while relayed
-             * traffic keeps flowing between this pair. */
-            sn_relay_maybe_assign( sss, &cmn, sender_peer->mac_addr,
-                                   compact_dstMac, now );
             try_forward( sss, &cmn, compact_dstMac, rec_buf, encx );
         }
         else
@@ -3262,9 +2916,6 @@ static int process_udp( n2n_sn_t * sss,
         /* Common section to forward the final product. */
         if ( unicast )
         {
-            /* Relay election: keep assigning a relay edge while relayed
-             * traffic keeps flowing between this pair. */
-            sn_relay_maybe_assign( sss, &cmn, pkt.srcMac, pkt.dstMac, now );
             try_forward( sss, &cmn, pkt.dstMac, rec_buf, encx );
         }
         else
@@ -3343,36 +2994,6 @@ static int process_udp( n2n_sn_t * sss,
     else if ( msg_type == MSG_TYPE_REGISTER_ACK )
     {
         traceEvent( TRACE_DEBUG, "Rx REGISTER_ACK (NOT IMPLEMENTED) Should not be via supernode" );
-    }
-    else if ( msg_type == n2n_relay_ready )
-    {
-        /* Edge->sn readiness report: the relay edge C says it already holds a
-         * direct with BOTH endpoints (src_mac=A, dst_mac=B) of a relay pair, so
-         * the assignment is real and offloadable. Verify the current assigned
-         * relay for that pair really is C, then tell A (and B) it may test the
-         * full A--R--B path. Only the elected C may report; anything else is
-         * ignored (cheap hijack guard). */
-        n2n_RELAY_READY_t rdy;
-        decode_RELAY_READY( &rdy, &cmn, udp_buf, &rem, &idx );
-
-        {
-            n2n_sn_relay_t * ra = sn_relay_find( sss, rdy.src_mac, rdy.dst_mac, n2n_now() );
-            struct peer_info * pa = find_peer_by_mac( sss->edges, rdy.src_mac );
-            struct peer_info * pb = find_peer_by_mac( sss->edges, rdy.dst_mac );
-            macstr_t mac_buf3;
-
-            if ( ra && ra->assigned &&
-                 memcmp( ra->r, rdy.relay_mac, N2N_MAC_SIZE ) == 0 )
-            {
-                /* Confirm back to both endpoints (only if they are the real peers) */
-                if ( pa ) sn_relay_send_ready( sss, &cmn, pa, ra->r, rdy.src_mac, rdy.dst_mac );
-                if ( pb ) sn_relay_send_ready( sss, &cmn, pb, ra->r, rdy.src_mac, rdy.dst_mac );
-                traceEvent( TRACE_INFO, "relay ready confirmed: %s<->%s via %s",
-                            macaddr_str( mac_buf, rdy.src_mac ),
-                            macaddr_str( mac_buf2, rdy.dst_mac ),
-                            macaddr_str( mac_buf3, rdy.relay_mac ) );
-            }
-        }
     }
     else if ( msg_type == n2n_deregister )
     {
@@ -3815,9 +3436,6 @@ static int process_udp( n2n_sn_t * sss,
         const n2n_sock_t *local_sock_ptr = (reg.aflags & N2N_AFLAGS_LOCAL_SOCKET) ? &reg.local_sock : NULL;
         uint8_t local_sock_ena = (reg.aflags & N2N_AFLAGS_LOCAL_SOCKET) ? 1 : 0;
         uint8_t force_peer_info = (reg.aflags & N2N_AFLAGS_FORCE_PEER_INFO) ? 1 : 0;
-        /* Peer-relay willingness reported by the edge (default: auto-consent). */
-        uint8_t relay_mode = (reg.aflags & N2N_AFLAGS_RELAY_WILLING) ? 2 :
-                             (reg.aflags & N2N_AFLAGS_RELAY_REFUSE) ? 0 : 1;
 
         /* Check IP conflict: different MAC, same IP in same community */
         if (!query_only && use_request_ip && use_requested_ip != 0) {
@@ -3862,7 +3480,6 @@ static int process_udp( n2n_sn_t * sss,
                          ? &reg.own_ipv6 : NULL,
                      now, NULL, NULL,
                      N2N_NAT_FROM_AFLAGS(reg.aflags),
-                     relay_mode,
                      use_request_ip, use_requested_ip );
 
         /* NAT type changed with unchanged address (update_edge == 2):

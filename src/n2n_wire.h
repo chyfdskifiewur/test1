@@ -61,16 +61,8 @@ enum n2n_pc
     n2n_probe_ack=10,           /* P2P hole-punch result: observed addr via supernode */
     n2n_peer_info=11,           /* Supernode pushes peer address to edge */
     n2n_query_peer=12,          /* Edge asks supernode for peer address */
-    n2n_relay_assign=13,        /* Supernode assigns a peer relay for a dst MAC */
-    n2n_relay_ready=14          /* Relay edge (R) confirms both directs are up; sn
-                                 * relays the "usable" notice to the sender so it
-                                 * tests the A--R--B path BEFORE switching off the
-                                 * sn copy. Two roles on one packet type:
-                                 *   edge->sn : R reports "I already hold R<->A and
-                                 *               R<->B; the pair is offloadable";
-                                 *   sn->edge : the sn confirms the assignment is
-                                 *               still valid and the sender may
-                                 *               begin testing via R. */
+    n2n_relay_assign=13,        /* Supernode assigns a peer edge (B) to relay a pair */
+    n2n_relay_ready=14          /* B edge reports relaying feasible/impossible, and sn echoes the go-ahead */
 };
 
 typedef enum n2n_pc n2n_pc_t;
@@ -186,13 +178,13 @@ typedef struct n2n_PACKET n2n_PACKET_t;
                                              (reserved: needs a never-contacted 3rd IP) */
 #define N2N_AFLAGS_NAT_RESTRICTED 0x0200  /* edge reports address-restricted cone NAT */
 #define N2N_AFLAGS_NAT_PORT_RESTRICT 0x0400 /* edge reports port-restricted NAT */
+#define N2N_AFLAGS_RELAY_REFUSE  0x0800  /* edge runs with -Z 0: refuses to act as relay B */
+#define N2N_AFLAGS_RELAY_WILLING 0x1000  /* edge runs with -Z 2: willing relay B (preferred) */
 #define N2N_AFLAGS_FORCE_PEER_INFO 0x0008  /* force supernode to push all peer info */
 #define N2N_AFLAGS_QUERY_ONLY     0x0010  /* REGISTER_SUPER is a one-shot query
-                                              (e.g. ask sn2 for sn1's current address):
-                                              supernode replies with an ACK but does
-                                              NOT register/persist this edge as a peer */
-#define N2N_AFLAGS_RELAY_REFUSE   0x0800  /* edge refuses to act as peer relay */
-#define N2N_AFLAGS_RELAY_WILLING  0x1000  /* edge volunteers as preferred peer relay */
+                                             (e.g. ask sn2 for sn1's current address):
+                                             supernode replies with an ACK but does
+                                             NOT register/persist this edge as a peer */
 
 struct n2n_REGISTER_SUPER
 {
@@ -479,16 +471,17 @@ size_t decode_QUERY_PEER( n2n_QUERY_PEER_t * pkt,
                           const uint8_t * base,
                           size_t * rem, size_t * idx );
 
-/* RELAY_ASSIGN: supernode -> edge, assign a relay edge for traffic to a
- * destination MAC when direct P2P fails. Data plane decentralisation: the
- * edge sends such packets to the relay edge (a supernode-elected peer)
- * instead of the supernode. The relay itself forwards with pseudo-sn
- * semantics and needs no per-assignment signalling. */
+/* RELAY_ASSIGN: supernode -> sender, and supernode -> relay.
+ * - To the BIDIRECTIONAL pair the supernode picked a relay for:
+ *     relay_mac/relay_sock = the chosen relay, dst_mac = the far endpoint.
+ *   The sender stores "traffic to dst goes via relay".
+ * - To the RELAY itself, relay_mac equals its own MAC: it is being asked to
+ *   forward traffic destined for dst_mac. */
 typedef struct n2n_RELAY_ASSIGN {
-    n2n_mac_t   relay_mac;      /* relay edge's MAC */
-    n2n_sock_t  relay_sock;     /* relay edge's public IPv4 address */
-    n2n_mac_t   dst_mac;        /* traffic to this MAC goes via the relay */
-    uint16_t    lifetime;       /* assignment validity in seconds */
+    n2n_mac_t   relay_mac;      /* chosen relay edge's MAC */
+    n2n_sock_t  relay_sock;     /* chosen relay edge's public address */
+    n2n_mac_t   dst_mac;        /* the far (destination) endpoint of the pair */
+    uint16_t    lifetime;       /* seconds this assignment stays valid */
 } n2n_RELAY_ASSIGN_t;
 
 size_t encode_RELAY_ASSIGN( uint8_t * base, size_t * idx,
@@ -500,15 +493,19 @@ size_t decode_RELAY_ASSIGN( n2n_RELAY_ASSIGN_t * pkt,
                             const uint8_t * base,
                             size_t * rem, size_t * idx );
 
-/* RELAY_READY: "the relay edge holds BOTH directs (R<->A and R<->B), so the
- * pair is offloadable". Sent C->sn by the relay edge once it confirms both
- * endpoints are directly reachable, and sn->A/B as the "usable" go-ahead.
- * Fields identify the relay edge and the ATTACHED endpoint (the other endpoint
- * of the pair is implicit from the direction / the relay assignment). */
+/* RELAY_READY: yes/no answer about whether relaying through a peer is usable.
+ * Two roles on one packet type:
+ * - relay -> supernode : the relay reports "the pair is offloadable through me"
+ *   (feasible=1, it holds a direct to BOTH endpoints and relayed data one way)
+ *   or "I cannot relay this pair" (feasible=0, one endpoint never connected).
+ * - supernode -> endpoints : echoes feasible=1 as the go-ahead once the relay
+ *   reported the path usable, telling both ends they may begin using it.
+ * src_mac/dst_mac name the pair; relay_mac names the relay. */
 typedef struct n2n_RELAY_READY {
     n2n_mac_t   relay_mac;      /* relay edge's MAC */
-    n2n_mac_t   src_mac;        /* C->sn: peer R holds a direct with; sn->A: A */
-    n2n_mac_t   dst_mac;        /* the other endpoint of the relay pair */
+    n2n_mac_t   src_mac;        /* one endpoint of the pair (the initiator) */
+    n2n_mac_t   dst_mac;        /* the other endpoint of the pair */
+    uint8_t     feasible;       /* 1 = relaying works through this relay, 0 = it cannot */
 } n2n_RELAY_READY_t;
 
 size_t encode_RELAY_READY( uint8_t * base, size_t * idx,

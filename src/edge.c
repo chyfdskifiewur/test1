@@ -382,7 +382,6 @@ static int edge_init(n2n_edge_t * eee)
     memset(&eee->sn1_probe_addr, 0, sizeof(n2n_sock_t));
     eee->sn_probe_cookie_valid = 0;
     eee->nat_type = N2N_NAT_UNKNOWN;
-    eee->relay_mode = 1; /* auto-consent as peer relay by default (-Z) */
     memset(&eee->nat_seen_sn1, 0, sizeof(n2n_sock_t));
     memset(&eee->nat_seen_sn2, 0, sizeof(n2n_sock_t));
     eee->nat_probe_time = 0;
@@ -823,7 +822,6 @@ static void help() {
     printf("-f                       | Do not fork and run as a daemon; rather run in foreground.\n");
 #endif /* #ifdef N2N_HAVE_DAEMON */
     printf("-G                       | Gaming mode: actively probe all peers to trigger P2P.\n");
-    printf("-Z <mode>                | Peer relay willingness: 0=refuse, 1=auto (default), 2=willing.\n");
 #ifndef _WIN32
     printf("-g <GID>                 | Group ID (numeric) to use when privileges are dropped.\n");
     printf("-u <UID>                 | User ID (numeric) to use when privileges are dropped.\n");
@@ -839,6 +837,7 @@ static void help() {
     printf("-T <token>               | Supernode registration token (ASCII, max 32).\n");
     printf("-v                       | Make more verbose. Repeat as required.\n");
     printf("-w                       | WebSocket mode: relay via supernode over WS (TCP), disable P2P.\n");
+    printf("-Z <0|1|2>                | Peer relay willingness: 0=refuse, 1=auto (default), 2=willing.\n");
     printf("-h                       | Show this help message.\n");
 
     printf("\nEnvironment variables:\n");
@@ -1424,12 +1423,12 @@ static void send_register_super( n2n_edge_t * eee,
         case N2N_NAT_CONE:          reg.aflags |= N2N_AFLAGS_NAT_CONE; break;
         case N2N_NAT_SYMMETRIC:     reg.aflags |= N2N_AFLAGS_NAT_SYMMETRIC; break;
         }
-
-        /* Peer-relay willingness: -Z 0 refuses, -Z 2 volunteers; the
-         * default (1) sends no flag = auto-consent. */
-        if ( eee->relay_mode == 0 )
+        /* Report relay willingness to the supernode so it knows this member
+         * may be chosen to relay for others. AUTO (1) carries no flag: a member
+         * that never set -Z is auto-eligible, keeping old behavior. */
+        if ( eee->relay_mode == N2N_RELAY_MODE_REFUSE )
             reg.aflags |= N2N_AFLAGS_RELAY_REFUSE;
-        else if ( eee->relay_mode == 2 )
+        else if ( eee->relay_mode == N2N_RELAY_MODE_WILLING )
             reg.aflags |= N2N_AFLAGS_RELAY_WILLING;
     }
 
@@ -2838,450 +2837,6 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
     eee->last_register_req = nowTime;
 }
 
-/* ===================== peer relay (edge side) ===================== */
-
-/* Liveness rules for a relay assignment ("R"): traffic only switches to R
- * after the A--R--B path has proven itself; until then the sn stays the
- * working path and packets are dual-sent (probe). Evidence of life is any
- * packet received from relay_sock (relayed replies, TCP ACKs, ...).
- * RELAY_DEAD_SECS: probe window AND staleness bound — silence from
- * relay_sock longer than this degrades back to the sn relay.
- * RELAY_RETRY_SECS: after a failed probe, wait this long before probing
- * again. A dead R never blackholes traffic: the sn copy always flows. */
-#define RELAY_DEAD_SECS   15
-#define RELAY_RETRY_SECS  60
-#define RELAY_RT_TTL      300  /* R: how long a sender's inbound path is remembered */
-
-/* A peer is "legacy" when it shows no sign of new-style code (version string
- * or a reported NAT type): old peers neither use relay assignments nor accept
- * R-forwarded frames whose UDP source is not their supernode (pseudo-sn would
- * be dropped). See the body — either signal alone proves new code, since the
- * relay-relevant wire messages carry no version but do carry NAT aflags. */
-static int peer_is_legacy( const struct peer_info * p )
-{
-    /* A real version string proves a new-style peer. So does a reported NAT
-     * type: edges never carry a version on the wire they arrive by here. A
-     * destination we relay for (11) is learned via the sn's PEER_INFO push,
-     * whose version comes from the sn's REGISTER_SUPER record — and that
-     * message has NO version field, so it is always "unknown". What the sn
-     * DOES stamp into the push is the peer's NAT type (N2N_NAT_AFLAGS), which
-     * only new edges ever report. Hence: non-legacy = version present OR nat
-     * known. A peer with nat UNKNOWN (e.g. R's own still-classifying peer) is
-     * conservatively treated as legacy — the matching sn-side rule keeps
-     * these consistent. */
-    if ( p->version[0] != '\0' && strcmp( p->version, "unknown" ) != 0 )
-        return 0;
-    if ( p->nat_type != N2N_NAT_UNKNOWN )
-        return 0;
-    return 1;
-}
-
-/* Sender-role modes returned by relay_find_dest:
- * RELAY_NONE  - no usable assignment: traffic stays on the sn
- * RELAY_USE   - the A--R--B path has proven itself: switch traffic to R.
- *               Proof = the direct connection to R is up (R registered into
- *               known_peers after the sn-pushed PEER_INFO punch), or fresh
- *               return traffic from relay_sock as a fallback
- * RELAY_PROBE - assignment present but unproven: keep the sn copy as the
- *               working path and speculatively send a copy to R while the
- *               endpoint<->relay direct connection is being established */
-#define RELAY_NONE    0
-#define RELAY_USE     1
-#define RELAY_PROBE   2
-
-/* R role: remember the source address each sender last used to reach us
- * (reply takes the same path — the registered sn-mapping of a symmetric /
- * port-restricted destination is not open to the relay). PEERS_LOCK held. */
-static void relay_rt_note( n2n_edge_t * eee, const n2n_mac_t mac,
-                           const n2n_sock_t * sock, time_t now )
-{
-    int i, free_slot = -1, oldest = 0;
-
-    for ( i = 0; i < N2N_EDGE_RELAY_RT_MAX; i++ )
-    {
-        n2n_relay_rt_t * t = &eee->relay_rt[i];
-        if ( t->seen != 0 && ( now - t->seen ) < RELAY_RT_TTL &&
-             memcmp( t->mac, mac, N2N_MAC_SIZE ) == 0 )
-        {
-            t->sock = *sock;
-            t->seen = now;
-            return;
-        }
-        if ( t->seen == 0 || ( now - t->seen ) >= RELAY_RT_TTL )
-            free_slot = i;
-        else if ( t->seen < eee->relay_rt[oldest].seen )
-            oldest = i;
-    }
-    {
-        n2n_relay_rt_t * t = &eee->relay_rt[ free_slot >= 0 ? free_slot : oldest ];
-        memcpy( t->mac, mac, N2N_MAC_SIZE );
-        t->sock = *sock;
-        t->seen = now;
-    }
-}
-
-static const n2n_sock_t * relay_rt_lookup( n2n_edge_t * eee, const n2n_mac_t mac,
-                                           time_t now ) /* PEERS_LOCK held */
-{
-    int i;
-
-    for ( i = 0; i < N2N_EDGE_RELAY_RT_MAX; i++ )
-    {
-        n2n_relay_rt_t * t = &eee->relay_rt[i];
-        if ( t->seen != 0 && ( now - t->seen ) < RELAY_RT_TTL &&
-             memcmp( t->mac, mac, N2N_MAC_SIZE ) == 0 )
-            return &t->sock;
-    }
-    return NULL;
-}
-
-/* Find the relay assignment for dst_mac (sender role: relay_mac != own MAC,
- * unicast only). Sets *dest to the relay's public sock and returns the mode.
- * Must be called under PEERS_LOCK. */
-static int relay_find_dest( n2n_edge_t * eee,
-                            const n2n_mac_t dst_mac,
-                            n2n_sock_t * dest,
-                            time_t now )
-{
-    int i;
-
-    if ( is_multi_broadcast( dst_mac ) )
-        return RELAY_NONE; /* broadcasts always go through the sn */
-
-    for ( i = 0; i < N2N_EDGE_RELAY_MAX; i++ )
-    {
-        n2n_relay_entry_t * r = &eee->relay_table[i];
-        if ( !r->valid || now >= r->expires ) continue;
-        if ( memcmp( r->dst_mac, dst_mac, N2N_MAC_SIZE ) != 0 ) continue;
-        if ( memcmp( r->relay_mac, eee->device.mac_addr, N2N_MAC_SIZE ) == 0 )
-            continue; /* own entry: we are R for others, not for ourselves */
-        if ( r->relay_sock.family == 0 ) continue;
-
-        /* ONLY switch off the sn copy when the FULL path is proven end to end:
-         * (a) the sn told us the relay C already holds BOTH directs (r->ready,
-         *     set by the sn on reception of C's readiness report — a half-open
-         *     A<->R direct never fakes this), AND
-         * (b) we have recently received B's reply THROUGH R (r->last_via: a
-         *     PACKET from relay_sock whose src was our entry's dst_mac).
-         * Prefer the direct address we hold for R (freshest inbound), else the
-         * registered sock. */
-        if ( r->ready && r->last_via != 0 &&
-             ( now - r->last_via ) <= RELAY_DEAD_SECS )
-        {
-            struct peer_info * rp = find_peer_by_mac( eee->known_peers, r->relay_mac );
-            if ( rp && rp->sock.family != 0 )
-                memcpy( dest, &rp->sock, sizeof( n2n_sock_t ) );
-            else
-                memcpy( dest, &r->relay_sock, sizeof( n2n_sock_t ) );
-            return RELAY_USE;
-        }
-
-        /* Not yet proven / still probing: keep dual-sending (sn copy always
-         * flows, R copy for evidence) with pacing, so we NEVER blackhole —
-         * the sn remains the working path until the full A--R--B path proves
-         * itself. */
-        if ( r->last_try != 0 && ( now - r->last_try ) < RELAY_DEAD_SECS )
-        {
-            memcpy( dest, &r->relay_sock, sizeof( n2n_sock_t ) );
-            return RELAY_PROBE; /* window still open, keep dual-sending */
-        }
-        if ( r->last_try != 0 && ( now - r->last_try ) < RELAY_RETRY_SECS )
-            return RELAY_NONE; /* cooldown after a failed probe */
-
-        r->last_try = now;
-        memcpy( dest, &r->relay_sock, sizeof( n2n_sock_t ) );
-        return RELAY_PROBE;
-    }
-    return RELAY_NONE;
-}
-
-/* Record evidence of a FULL-PATH frame: a packet received FROM THE RELAY EDGE
- * (identified by its entry's relay_mac — its actual sock, which may be the
- * direct A<->R socket rather than the registered relay_sock) whose source MAC
- * is the relayed endpoint (our entry's dst_mac). Only this proves the end-to-end
- * A--R--B path; a raw keepalive from R does not. Must be called under PEERS_LOCK. */
-static void relay_note_via( n2n_edge_t * eee, const n2n_sock_t * sender,
-                            const n2n_mac_t srcMac, time_t now )
-{
-    int i;
-
-    if ( sender->family == 0 ) return;
-    for ( i = 0; i < N2N_EDGE_RELAY_MAX; i++ )
-    {
-        n2n_relay_entry_t * r = &eee->relay_table[i];
-        if ( !r->valid ) continue;
-        if ( memcmp( r->dst_mac, srcMac, N2N_MAC_SIZE ) != 0 ) continue;
-
-        /* The frame must actually come from THIS entry's relay edge. Match by
-         * MAC so the direct A<->R address also counts, in addition to the
-         * registered relay_sock. */
-        {
-            struct peer_info * rp = find_peer_by_mac( eee->known_peers, r->relay_mac );
-            int from_relay = ( sock_equal( &r->relay_sock, sender ) == 0 );
-            if ( rp && rp->sock.family != 0 &&
-                 sock_equal( &rp->sock, sender ) == 0 )
-                from_relay = 1;
-            if ( from_relay )
-                r->last_via = now;
-        }
-    }
-}
-
-/* R side: when we are the relay for a forwarded frame (A -> dst B), check that
- * BOTH A and B are directly reachable (in known_peers with a fresh sock). Only
- * then may this pair be offloaded; tell the sn so (throttled, one report per
- * RELAY_RETRY_SECS). The sn confirms the assignment still holds and relays
- * the "usable" go-ahead to A/B — A switches only once it has that AND full-path
- * evidence. */
-static void relay_report_ready( n2n_edge_t * eee,
-                                const n2n_mac_t srcMac, /* A */
-                                const n2n_mac_t dstMac, /* B */
-                                time_t now )
-{
-    struct peer_info * pa = NULL, * pb = NULL;
-    n2n_common_t    cmn;
-    n2n_RELAY_READY_t rdy;
-    uint8_t         buf[N2N_PKT_BUF_SIZE];
-    size_t          idx = 0;
-    macstr_t        mb1, mb2;
-    int             k;
-
-    PEERS_LOCK( eee );
-    pa = find_peer_by_mac( eee->known_peers, srcMac );
-    pb = find_peer_by_mac( eee->known_peers, dstMac );
-    if ( !( pa && pb && pa->sock.family != 0 && pb->sock.family != 0 ) )
-    {
-        /* not BOTH directs up yet: keep the sn relay, report later */
-        PEERS_UNLOCK( eee );
-        return;
-    }
-
-    /* both directs up (A->R and B->R). Check throttle / our duty. */
-    k = N2N_EDGE_RELAY_MAX;
-    for ( k = 0; k < N2N_EDGE_RELAY_MAX; k++ )
-    {
-        n2n_relay_entry_t * r = &eee->relay_table[k];
-        if ( r->valid && now < r->expires &&
-             memcmp( r->dst_mac, dstMac, N2N_MAC_SIZE ) == 0 &&
-             memcmp( r->relay_mac, eee->device.mac_addr, N2N_MAC_SIZE ) == 0 &&
-             ( now - r->last_ready_report ) >= RELAY_RETRY_SECS )
-        {
-            r->last_ready_report = now;
-            break;
-        }
-    }
-    PEERS_UNLOCK( eee );
-    if ( k >= N2N_EDGE_RELAY_MAX ) return; /* throttled or not our duty */
-
-    /* Build and send the readiness report to the sn. */
-    memset( &cmn, 0, sizeof(cmn) );
-    cmn.ttl        = N2N_DEFAULT_TTL;
-    cmn.pc         = n2n_relay_ready;
-    cmn.flags      = 0; /* edge->sn */
-    memcpy( cmn.community, eee->community_name, N2N_COMMUNITY_SIZE );
-    memset( &rdy, 0, sizeof(rdy) );
-    memcpy( rdy.relay_mac, eee->device.mac_addr, N2N_MAC_SIZE );
-    memcpy( rdy.src_mac, srcMac, N2N_MAC_SIZE );   /* A */
-    memcpy( rdy.dst_mac, dstMac, N2N_MAC_SIZE );   /* B */
-    idx = 0;
-    encode_RELAY_READY( buf, &idx, &cmn, &rdy );
-    edge_send_to_sn( eee, buf, idx );
-    macaddr_str( mb1, srcMac );
-    macaddr_str( mb2, dstMac );
-    traceEvent( TRACE_INFO, "relay ready: reporting %s<->%s to sn", mb1, mb2 );
-}
-
-/* A side: the sn confirmed the relay C holds BOTH directs (C reported ready),
- * so a full A--R--B offload is permitted. Mark the matching sender-role entry
- * ready; relay_find_dest still waits for full-path evidence (last_via) before
- * switching, so this alone never switches off the sn copy. */
-static void handle_relay_ready( n2n_edge_t * eee, const n2n_RELAY_READY_t * rry )
-{
-    time_t now = n2n_now();
-    int i;
-    macstr_t buf1, buf2;
-
-    if ( memcmp( rry->relay_mac, eee->device.mac_addr, N2N_MAC_SIZE ) == 0 )
-        return; /* we are R: nothing to do, we already know */
-
-    PEERS_LOCK( eee );
-    for ( i = 0; i < N2N_EDGE_RELAY_MAX; i++ )
-    {
-        n2n_relay_entry_t * r = &eee->relay_table[i];
-        if ( r->valid && now < r->expires &&
-             memcmp( r->dst_mac, rry->dst_mac, N2N_MAC_SIZE ) == 0 &&
-             memcmp( r->relay_mac, rry->relay_mac, N2N_MAC_SIZE ) == 0 )
-        {
-            r->ready = 1;
-            break;
-        }
-    }
-    PEERS_UNLOCK( eee );
-
-    traceEvent( TRACE_INFO, "relay ready: path via %s to %s usable",
-                macaddr_str( buf1, rry->relay_mac ),
-                macaddr_str( buf2, rry->dst_mac ) );
-}
-
-/* R side: store an assignment coming from the supernode. When relay_mac is
- * our own MAC we are the relay for traffic to dst_mac; otherwise the entry
- * tells our send path where to send traffic for dst_mac. */
-static void handle_relay_assign( n2n_edge_t * eee, const n2n_RELAY_ASSIGN_t * ras )
-{
-    time_t now = n2n_now();
-    int i, slot = -1, oldest = 0;
-    macstr_t buf1, buf2;
-    n2n_sock_str_t buf3;
-
-    if ( ras->lifetime == 0 ) return;
-
-    PEERS_LOCK( eee ); /* relay_table is shared with the TAP thread */
-    for ( i = 0; i < N2N_EDGE_RELAY_MAX; i++ )
-    {
-        n2n_relay_entry_t * r = &eee->relay_table[i];
-        if ( r->valid && memcmp( r->dst_mac, ras->dst_mac, N2N_MAC_SIZE ) == 0 )
-        {
-            slot = i; /* refresh existing assignment */
-            break;
-        }
-        if ( !r->valid || r->expires <= now )
-        {
-            if ( slot < 0 ) slot = i; /* reuse a stale slot */
-        }
-        else if ( r->expires < eee->relay_table[oldest].expires )
-        {
-            oldest = i;
-        }
-    }
-    if ( slot < 0 ) slot = oldest; /* all busy: evict the soonest-expiring */
-
-    {
-        n2n_relay_entry_t * r = &eee->relay_table[slot];
-        /* A new relay invalidates the old relay-path evidence and readiness. */
-        if ( memcmp( r->relay_mac, ras->relay_mac, N2N_MAC_SIZE ) != 0 ||
-             sock_equal( &r->relay_sock, &ras->relay_sock ) != 0 )
-        {
-            r->last_via = 0;
-            r->ready = 0; /* a fresh relay must re-prove the full path */
-        }
-        r->valid     = 1;
-        memcpy( r->dst_mac, ras->dst_mac, N2N_MAC_SIZE );
-        memcpy( r->relay_mac, ras->relay_mac, N2N_MAC_SIZE );
-        r->relay_sock = ras->relay_sock;
-        r->expires   = now + ras->lifetime;
-        r->last_try  = 0; /* a fresh assignment is tried immediately */
-    }
-    PEERS_UNLOCK( eee );
-
-    traceEvent( TRACE_INFO, "relay assign: to %s via %s (%s) for %us%s",
-                macaddr_str( buf1, ras->dst_mac ),
-                macaddr_str( buf2, ras->relay_mac ),
-                sock_to_cstr( buf3, &ras->relay_sock ),
-                (unsigned)ras->lifetime,
-                memcmp( ras->relay_mac, eee->device.mac_addr, N2N_MAC_SIZE ) == 0 ?
-                " [we relay]" : "" );
-}
-
-/* R role: forward a PACKET that was addressed to another edge and for which
- * we hold a relay assignment. The encrypted payload is forwarded verbatim
- * (no decrypt/re-encrypt); only the header changes: ttl-1, FROM_SUPERNODE
- * (pseudo-sn semantics, so the destination accepts the frame from our
- * address) and the original sender's sock so the destination can learn it.
- * Direct to the destination when its address is known, else via the sn.
- * @return 1 if forwarded/dropped as relay duty, 0 if not our duty. */
-static int relay_forward( n2n_edge_t * eee,
-                          const n2n_common_t * cmn,
-                          const n2n_PACKET_t * pkt,
-                          const uint8_t * payload,
-                          size_t psize,
-                          const n2n_sock_t * orig_sender )
-{
-    uint8_t         pktbuf[N2N_PKT_BUF_SIZE];
-    n2n_common_t    cmn2;
-    n2n_PACKET_t    pkt2;
-    n2n_sock_t      dest;
-    n2n_sock_str_t  sockbuf;
-    struct peer_info * dpeer = NULL;
-    size_t          idx = 0;
-    time_t          now = n2n_now();
-    int             i, have_dest = 0;
-
-    if ( is_multi_broadcast( pkt->dstMac ) ||
-         memcmp( pkt->dstMac, eee->device.mac_addr, N2N_MAC_SIZE ) == 0 )
-        return 0;
-
-    PEERS_LOCK( eee ); /* relay_table is shared with the TAP thread */
-    for ( i = 0; i < N2N_EDGE_RELAY_MAX; i++ )
-    {
-        n2n_relay_entry_t * r = &eee->relay_table[i];
-        if ( r->valid && now < r->expires &&
-             memcmp( r->dst_mac, pkt->dstMac, N2N_MAC_SIZE ) == 0 &&
-             memcmp( r->relay_mac, eee->device.mac_addr, N2N_MAC_SIZE ) == 0 )
-            break;
-    }
-    if ( i < N2N_EDGE_RELAY_MAX )
-        relay_rt_note( eee, pkt->srcMac, orig_sender, now ); /* reply path */
-    PEERS_UNLOCK( eee );
-    if ( i >= N2N_EDGE_RELAY_MAX ) return 0; /* not our relay duty */
-
-    /* R side: this A--R--B frame — if both A and B are directly reachable we
-     * deserve to be the relay for this pair; report readiness to the sn so it
-     * can confirm the assignment and let the sender offload. */
-    relay_report_ready( eee, pkt->srcMac, pkt->dstMac, now );
-
-    if ( cmn->ttl == 0 )
-    {
-        traceEvent( TRACE_DEBUG, "relay: ttl exhausted, dropping" );
-        return 1; /* loop guard */
-    }
-
-    /* Forward the unchanged encrypted payload behind a rebuilt header. */
-    cmn2 = *cmn;
-    cmn2.ttl--;
-    cmn2.flags |= N2N_FLAGS_FROM_SUPERNODE;
-    pkt2 = *pkt;
-    if ( pkt2.sock.family == 0 )
-        pkt2.sock = *orig_sender; /* let the destination learn the sender */
-
-    idx = 0;
-    encode_PACKET( pktbuf, &idx, &cmn2, &pkt2 );
-    memcpy( pktbuf + idx, payload, psize );
-
-    /* Direct hop preferred: use whatever address we hold for the target.
-     * NEW-style destinations only — a legacy edge drops pseudo-sn frames
-     * from our address, so its traffic must go via the real sn instead.
-     * The freshest inbound address wins: it is the mapping the target's
-     * NAT will accept replies on (symmetric / port-restr safe); fall back
-     * to the registered sock. */
-    PEERS_LOCK( eee );
-    dpeer = find_peer_by_mac( eee->known_peers, pkt->dstMac );
-    if ( !dpeer ) dpeer = find_peer_by_mac( eee->pending_peers, pkt->dstMac );
-    if ( dpeer && !dpeer->punch_failed && !peer_is_legacy( dpeer ) )
-    {
-        if ( dpeer->sock.family != 0 ) { dest = dpeer->sock; have_dest = 1; }
-        else if ( dpeer->sock6.family != 0 ) { dest = dpeer->sock6; have_dest = 1; }
-    }
-    {
-        const n2n_sock_t * rt = relay_rt_lookup( eee, pkt->dstMac, now );
-        if ( rt ) { dest = *rt; have_dest = 1; }
-    }
-    PEERS_UNLOCK( eee );
-
-    if ( have_dest )
-    {
-        traceEvent( TRACE_DEBUG, "relay: %u bytes to peer at %s",
-                    (unsigned)( idx + psize ), sock_to_cstr( sockbuf, &dest ) );
-        sendto_sock( sock_for_dest( eee, &dest ), pktbuf, idx + psize, &dest );
-    }
-    else
-    {
-        traceEvent( TRACE_DEBUG, "relay: %u bytes via sn (unknown peer)",
-                    (unsigned)( idx + psize ) );
-        edge_send_to_sn( eee, pktbuf, idx + psize );
-    }
-    return 1;
-}
-
 /* @return 1 if destination is a peer, 0 if destination is supernode */
 static int find_peer_destination(n2n_edge_t * eee,
                                  n2n_mac_t mac_address,
@@ -3381,6 +2936,407 @@ static const struct option long_options[] = {
 
 /* ***************************************************** */
 
+/* ==================== Peer-relay (edge side) ====================
+ * A group member (the "relay") carries a pair's traffic in place of the
+ * supernode. The pair keeps talking to the sn while it punches toward the
+ * relay; only after real end-to-end proof does the sender drop the sn copy.
+ *
+ * Naming: the code follows the roles, not fixed letters — "sender" sends the
+ * data, "receiver" is its destination, "relay" forwards between them. Each of
+ * the three may appear many times, so the wire uses MAC addresses everywhere. */
+
+#define RELAY_NONE    0   /* no/poor relay path: keep using the supernode only */
+#define RELAY_USE     1   /* relay proven usable: send to the relay only */
+#define RELAY_PROBE   2   /* not proven yet: dual-send sn copy + relay copy */
+#define RELAY_DEAD_SECS   15   /* a frame/path seen this recently is "fresh" */
+#define RELAY_RETRY_SECS  60   /* throttle: how often to talk to the supernode */
+#define RELAY_UPDATE_SECS 15   /* relaying observation window length */
+
+/* find_peer_by_sock wrapper accepting an n2n_sock_t (v4 or v6). */
+static struct peer_info * relay_peer_by_sock( n2n_edge_t * eee, const n2n_sock_t * s )
+{
+    struct peer_info * p = NULL;
+    if ( s->family == AF_INET )
+    {
+        struct sockaddr_in sin;
+        memset( &sin, 0, sizeof(sin) );
+        sin.sin_family = AF_INET;
+        sin.sin_port = htons( s->port );
+        memcpy( &sin.sin_addr, s->addr.v4, 4 );
+        p = find_peer_by_sock( eee->known_peers, (struct sockaddr *)&sin );
+        if ( !p ) p = find_peer_by_sock( eee->pending_peers, (struct sockaddr *)&sin );
+    }
+    else if ( s->family == AF_INET6 )
+    {
+        struct sockaddr_in6 sin6;
+        memset( &sin6, 0, sizeof(sin6) );
+        sin6.sin6_family = AF_INET6;
+        sin6.sin6_port = htons( s->port );
+        memcpy( &sin6.sin6_addr, s->addr.v6, 16 );
+        p = find_peer_by_sock( eee->known_peers, (struct sockaddr *)&sin6 );
+        if ( !p ) p = find_peer_by_sock( eee->pending_peers, (struct sockaddr *)&sin6 );
+    }
+    return p;
+}
+
+/* sender role lookup: the relay assignment that carries traffic to `dst`. */
+static n2n_relay_entry_t * relay_find_dst( n2n_edge_t * eee, const n2n_mac_t dst, time_t now )
+{
+    int i;
+    for ( i = 0; i < N2N_EDGE_RELAY_MAX; i++ )
+    {
+        n2n_relay_entry_t * r = &eee->relay_table[i];
+        if ( r->valid && now < r->expires && memcmp( r->dst_mac, dst, N2N_MAC_SIZE ) == 0 )
+            return r;
+    }
+    return NULL;
+}
+
+/* relay role lookup: am I (relay) responsible for forwarding to `dst`? */
+static n2n_relay_entry_t * relay_find_role( n2n_edge_t * eee, const n2n_mac_t dst, time_t now )
+{
+    int i;
+    for ( i = 0; i < N2N_EDGE_RELAY_MAX; i++ )
+    {
+        n2n_relay_entry_t * r = &eee->relay_table[i];
+        if ( r->valid && now < r->expires &&
+             memcmp( r->relay_mac, eee->device.mac_addr, N2N_MAC_SIZE ) == 0 &&
+             memcmp( r->dst_mac, dst, N2N_MAC_SIZE ) == 0 )
+            return r;
+    }
+    return NULL;
+}
+
+/* Return-path cache the relay keeps for the endpoints it serves, so a reply
+ * goes back out the exact socket the endpoint dialed in on. Needed for
+ * port-restricted / symmetric destinations that accept a reply only on that
+ * socket. */
+static void relay_rt_note( n2n_edge_t * eee, const n2n_mac_t mac, const n2n_sock_t * s, time_t now )
+{
+    int i, slot = -1;
+    time_t oldest = now;
+    for ( i = 0; i < 8; i++ )
+    {
+        n2n_relay_rt_entry_t * e = &eee->relay_rt[i];
+        if ( !e->valid ) { slot = i; break; }
+        if ( memcmp( e->mac, mac, N2N_MAC_SIZE ) == 0 )
+        {
+            e->sock = *s;
+            e->last_seen = now;
+            return;
+        }
+        if ( e->last_seen < oldest ) { oldest = e->last_seen; slot = i; }
+    }
+    if ( slot < 0 ) return;
+    memset( &eee->relay_rt[slot], 0, sizeof( eee->relay_rt[slot] ) );
+    memcpy( eee->relay_rt[slot].mac, mac, N2N_MAC_SIZE );
+    eee->relay_rt[slot].sock = *s;
+    eee->relay_rt[slot].last_seen = now;
+    eee->relay_rt[slot].valid = 1;
+}
+
+static int relay_rt_find( n2n_edge_t * eee, const n2n_mac_t mac, n2n_sock_t * out, time_t now )
+{
+    int i;
+    for ( i = 0; i < 8; i++ )
+    {
+        n2n_relay_rt_entry_t * e = &eee->relay_rt[i];
+        if ( e->valid && memcmp( e->mac, mac, N2N_MAC_SIZE ) == 0 && ( now - e->last_seen ) < RELAY_DEAD_SECS )
+        {
+            *out = e->sock;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* sender-side send decision for a destination that has a relay assigned.
+ * Returns RELAY_NONE/USE/PROBE and, for the relay paths, the address to reach
+ * the relay (preferring the direct address we hold for it). */
+static int relay_find_dest( n2n_edge_t * eee, const n2n_mac_t dst, n2n_sock_t * dest, time_t now )
+{
+    n2n_relay_entry_t * r = relay_find_dst( eee, dst, now );
+    struct peer_info * rp;
+    if ( !r ) return RELAY_NONE;
+
+    /* I am the relay for this destination — my own packets never go through me. */
+    if ( memcmp( r->relay_mac, eee->device.mac_addr, N2N_MAC_SIZE ) == 0 )
+        return RELAY_NONE;
+
+    /* Full end-to-end proof: the supernode echoed "feasible" AND we recently
+     * received a frame from the far endpoint VIA this relay. Only then is the
+     * sn copy switched off. Prefer the direct address we hold for the relay. */
+    if ( r->ready && r->last_via != 0 && ( now - r->last_via ) <= RELAY_DEAD_SECS )
+    {
+        rp = find_peer_by_mac( eee->known_peers, r->relay_mac );
+        if ( rp && rp->sock.family != 0 ) *dest = rp->sock;
+        else *dest = r->relay_sock;
+        return RELAY_USE;
+    }
+
+    /* Not proven yet: dual-send so nothing is lost while testing. Paced so we
+     * are not hammering the relay every packet. */
+    rp = find_peer_by_mac( eee->known_peers, r->relay_mac );
+    if ( r->last_try == 0 || ( now - r->last_try ) >= RELAY_UPDATE_SECS )
+    {
+        if ( rp && rp->sock.family != 0 ) *dest = rp->sock;
+        else *dest = r->relay_sock;
+        r->last_try = now;
+        return RELAY_PROBE;
+    }
+
+    /* cooldown: keep only the supernode copy this packet. */
+    return RELAY_NONE;
+}
+
+/* Full-path evidence on the sender side: a frame arrived whose transport
+ * source is the relay and whose virtual origin is the far endpoint we send
+ * toward through that relay. That means A--relay--far-end works end to end. */
+static void relay_note_via( n2n_edge_t * eee, const n2n_sock_t * sender,
+                            const n2n_sock_t * virtual_origin, time_t now )
+{
+    struct peer_info * relay_peer, * origin_peer;
+    int i;
+    if ( sender->family == AF_UNSPEC || virtual_origin->family == AF_UNSPEC ) return;
+    PEERS_LOCK( eee );
+    relay_peer = relay_peer_by_sock( eee, sender );
+    origin_peer = relay_peer_by_sock( eee, virtual_origin );
+    if ( relay_peer && origin_peer )
+    {
+        for ( i = 0; i < N2N_EDGE_RELAY_MAX; i++ )
+        {
+            n2n_relay_entry_t * r = &eee->relay_table[i];
+            if ( r->valid && now < r->expires &&
+                 memcmp( r->relay_mac, relay_peer->mac_addr, N2N_MAC_SIZE ) == 0 &&
+                 memcmp( r->dst_mac, origin_peer->mac_addr, N2N_MAC_SIZE ) == 0 )
+            {
+                r->last_via = now;
+                break;
+            }
+        }
+    }
+    PEERS_UNLOCK( eee );
+}
+
+/* Send a RELAY_READY report (relay side) to the supernode: either "this pair
+ * is offloadable through me" (feasible=1) or "I cannot relay it" (feasible=0).
+ * The supernode already knows which pair this relay serves, so the far
+ * endpoint alone is enough to identify it. */
+static void relay_report_send( n2n_edge_t * eee, n2n_relay_entry_t * r )
+{
+    n2n_common_t    cmn;
+    n2n_RELAY_READY_t m;
+    uint8_t         buf[N2N_SN_PKTBUF_SIZE];
+    size_t          idx = 0;
+
+    memset( &cmn, 0, sizeof(cmn) );
+    cmn.ttl = N2N_DEFAULT_TTL;
+    cmn.pc = n2n_relay_ready;
+    memcpy( cmn.community, eee->community_name, N2N_COMMUNITY_SIZE );
+
+    memset( &m, 0, sizeof(m) );
+    memcpy( m.relay_mac, eee->device.mac_addr, N2N_MAC_SIZE );
+    memcpy( m.dst_mac, r->dst_mac, N2N_MAC_SIZE );
+    m.feasible = r->feasible;
+
+    encode_RELAY_READY( buf, &idx, &cmn, &m );
+    edge_send_to_sn( eee, buf, idx );
+}
+
+/* Relay-role upkeep, run once per main-loop pass. Drives the observation
+ * window and the feasible / cannot reports for each pair this node relays. */
+static void relay_report_roles( n2n_edge_t * eee, time_t now )
+{
+    int i;
+    for ( i = 0; i < N2N_EDGE_RELAY_MAX; i++ )
+    {
+        n2n_relay_entry_t * r = &eee->relay_table[i];
+        if ( !r->valid ) continue;
+        if ( now >= r->expires )
+        {
+            memset( r, 0, sizeof(*r) );
+            continue;
+        }
+        if ( memcmp( r->relay_mac, eee->device.mac_addr, N2N_MAC_SIZE ) != 0 )
+            continue; /* sender-role entry, not mine to judge */
+
+        /* Fresh forwarded data = the forward path is real: say "feasible". */
+        if ( r->last_forward > 0 && ( now - r->last_forward ) < RELAY_DEAD_SECS )
+        {
+            r->feasible = 1;
+            r->obs_done  = 1;
+            if ( ( now - r->last_ready_report ) >= 5 )
+            {
+                r->last_ready_report = now;
+                relay_report_send( eee, r );
+            }
+            continue;
+        }
+
+        if ( !r->obs_done )
+        {
+            if ( r->obs_start == 0 ) r->obs_start = now;
+            if ( ( now - r->obs_start ) >= RELAY_UPDATE_SECS )
+            {
+                r->obs_done = 1;
+                if ( ( now - r->last_ready_report ) >= 5 )
+                {
+                    r->last_ready_report = now;
+                    r->feasible = 0; /* no data flowed in the window */
+                    relay_report_send( eee, r );
+                }
+            }
+            continue;
+        }
+
+        /* Observed, still no data. Report "cannot" throttled, and keep the
+         * opinion sticky until a data flow flips it to feasible. */
+        if ( r->feasible != 0 || ( now - r->last_ready_report ) >= RELAY_RETRY_SECS )
+        {
+            r->feasible = 0;
+            r->last_ready_report = now;
+            relay_report_send( eee, r );
+        }
+    }
+}
+
+/* Forward an encrypted frame (relay role): the destination matches an
+ * assignment that names this node as the relay. The payload is NOT decoded —
+ * it is relayed verbatim, so the transform stays intact for the receiver.
+ * Returns 1 if the frame was consumed for relaying, 0 if untouched. */
+static int relay_forward( n2n_edge_t * eee, const n2n_common_t * cmn,
+                          const n2n_PACKET_t * pkt, const n2n_sock_t * sender,
+                          const uint8_t * payload, size_t psize, time_t now )
+{
+    n2n_relay_entry_t * role;
+    n2n_sock_t tgt;
+    n2n_common_t c2;
+    n2n_PACKET_t pp;
+    uint8_t buf[N2N_PKT_BUF_SIZE];
+    size_t idx = 0;
+
+    role = relay_find_role( eee, pkt->dstMac, now );
+    if ( !role ) return 0;
+
+    /* Remember the source endpoint's inbound socket so replies return to it.
+     * The source of a relayed frame is the transport sender, not a fixed sn. */
+    if ( sender->family != AF_UNSPEC )
+        relay_rt_note( eee, pkt->srcMac, sender, now );
+
+    /* Where to forward: the endpoint's freshest inbound socket, else its
+     * registered address. If unknown, drop — the sn copy still delivers. */
+    memset( &tgt, 0, sizeof(tgt) );
+    if ( !relay_rt_find( eee, pkt->dstMac, &tgt, now ) )
+    {
+        struct peer_info * dp = find_peer_by_mac( eee->known_peers, pkt->dstMac );
+        if ( dp && dp->sock.family != 0 ) tgt = dp->sock;
+        else return 1;
+    }
+
+    if ( cmn->ttl <= 1 ) return 1; /* guard: never loop */
+
+    /* Rebuild a legacy PACKET header (the relay's name appears nowhere on the
+     * wire, only as the transport source). FROM_SUPERNODE + virtual origin let
+     * the receiver learn the true sender's address and recognize the relay. */
+    memset( &c2, 0, sizeof(c2) );
+    memcpy( c2.community, eee->community_name, N2N_COMMUNITY_SIZE );
+    c2.pc = n2n_packet;
+    c2.flags = N2N_FLAGS_FROM_SUPERNODE;
+    c2.ttl = (uint8_t)( cmn->ttl - 1 );
+
+    memset( &pp, 0, sizeof(pp) );
+    memcpy( pp.srcMac, pkt->srcMac, N2N_MAC_SIZE );
+    memcpy( pp.dstMac, pkt->dstMac, N2N_MAC_SIZE );
+    pp.sock = *sender; /* virtual origin: the original sender's address */
+    pp.transform = pkt->transform;
+
+    encode_PACKET( buf, &idx, &c2, &pp );
+    if ( idx + psize <= sizeof(buf) )
+    {
+        memcpy( buf + idx, payload, psize );
+        idx += psize;
+        sendto_sock( sock_for_dest( eee, &tgt ), buf, idx, &tgt );
+    }
+
+    role->last_forward = now;
+    return 1;
+}
+
+/* Apply a relay assignment received from the supernode. A single relay_table
+ * is keyed by destination mac: it is either the "traffic to dst goes via the
+ * relay" (sender role) or "I forward for dst" (relay role) depending on
+ * whether the named relay is this node. */
+static void handle_relay_assign( n2n_edge_t * eee, const n2n_RELAY_ASSIGN_t * a, time_t now )
+{
+    n2n_relay_entry_t * r = NULL;
+    int i, free_slot = -1;
+    uint16_t lifetime = a->lifetime ? a->lifetime : 240;
+
+    for ( i = 0; i < N2N_EDGE_RELAY_MAX; i++ )
+    {
+        if ( !eee->relay_table[i].valid ) { if ( free_slot < 0 ) free_slot = i; continue; }
+        if ( memcmp( eee->relay_table[i].dst_mac, a->dst_mac, N2N_MAC_SIZE ) == 0 )
+        {
+            r = &eee->relay_table[i];
+            break;
+        }
+    }
+    if ( !r )
+    {
+        if ( free_slot < 0 ) return;
+        r = &eee->relay_table[free_slot];
+        memset( r, 0, sizeof(*r) );
+        r->valid = 1;
+    }
+
+    memcpy( r->relay_mac, a->relay_mac, N2N_MAC_SIZE );
+    r->relay_sock = a->relay_sock;
+    memcpy( r->dst_mac, a->dst_mac, N2N_MAC_SIZE );
+    r->expires = now + lifetime;
+
+    /* fresh assignment resets both sender and relay observation state */
+    r->ready = 0;
+    r->last_via = 0;
+    r->last_try = 0;
+    r->feasible = 0;
+    r->obs_done = 0;
+    r->obs_start = now;
+    r->last_forward = 0;
+    r->last_ready_report = 0;
+}
+
+/* Supernode echoes the relay's "feasible" verdict to the endpoints. A "yes"
+ * arms the sender to switch once it has also seen end-to-end proof. */
+static void handle_relay_ready( n2n_edge_t * eee, const n2n_RELAY_READY_t * m, time_t now )
+{
+    int i;
+    for ( i = 0; i < N2N_EDGE_RELAY_MAX; i++ )
+    {
+        n2n_relay_entry_t * r = &eee->relay_table[i];
+        if ( !r->valid || now >= r->expires ) continue;
+        if ( memcmp( r->relay_mac, m->relay_mac, N2N_MAC_SIZE ) != 0 ) continue;
+        if ( memcmp( r->dst_mac, m->src_mac, N2N_MAC_SIZE ) != 0 &&
+             memcmp( r->dst_mac, m->dst_mac, N2N_MAC_SIZE ) != 0 ) continue;
+        r->ready = m->feasible ? 1 : 0;
+        if ( !m->feasible ) r->last_via = 0;
+    }
+}
+
+/* Periodic sweep: drop expired entries and, for relay-role entries, run the
+ * observation / reporting state machine. */
+static void relay_periodic( n2n_edge_t * eee, time_t now )
+{
+    int i;
+    for ( i = 0; i < N2N_EDGE_RELAY_MAX; i++ )
+    {
+        if ( eee->relay_table[i].valid && now >= eee->relay_table[i].expires )
+        {
+            memset( &eee->relay_table[i], 0, sizeof( eee->relay_table[i] ) );
+        }
+    }
+    relay_report_roles( eee, now );
+}
+
 /** Send an ecapsulated ethernet PACKET to a destination edge or broadcast MAC
  *  address. */
 static int send_PACKET( n2n_edge_t * eee,
@@ -3391,10 +3347,13 @@ static int send_PACKET( n2n_edge_t * eee,
     int dest;
     n2n_sock_str_t sockbuf;
     n2n_sock_t destination;
+    n2n_sock_t r_dest;
+    int rmode = RELAY_NONE;
     time_t now;
 
     /* hexdump( pktbuf, pktlen ); */
 
+    memset( &r_dest, 0, sizeof(r_dest) );
     now = n2n_now();
 
     /* No destination cache: look up the current destination on every packet.
@@ -3410,9 +3369,6 @@ static int send_PACKET( n2n_edge_t * eee,
      * packet to relay on lock contention would corrupt the P2P path. The
      * actual UDP send happens after the lock is released. */
     int probing = 0;
-    int relay_mode = RELAY_NONE;
-    n2n_sock_t relay_dest;
-    memset( &relay_dest, 0, sizeof(relay_dest) );
     if (eee->use_ws) {
         dest = 0;
         destination = eee->supernode;
@@ -3448,17 +3404,18 @@ static int send_PACKET( n2n_edge_t * eee,
                 eee->cached_dst_is_peer = 1;
                 eee->cached_dst_valid = 1;
             } else {
-                destination = eee->supernode;
-                /* Peer relay: the sn may have assigned an edge ("R").
-                 * Traffic switches to R only after the A--R--B path has
-                 * proven itself (RELAY_USE); until then the sn copy stays
-                 * the working path and R gets a speculative probe copy. */
-                relay_mode = relay_find_dest( eee, dstMac, &relay_dest, now );
-                if ( relay_mode == RELAY_USE ) {
-                    destination = relay_dest;
-                    ++(eee->tx_p2p); eee->p2p_tx_bytes += pktlen;
-                } else {
+                /* No direct P2P to dst yet. See whether a peer relay was
+                 * assigned for it; if so the traffic may go through the relay
+                 * (still keeping the sn copy until the path is proven). */
+                rmode = relay_find_dest( eee, dstMac, &r_dest, now );
+                if ( rmode == RELAY_NONE )
+                {
                     ++(eee->tx_sup); eee->super_tx_bytes += pktlen;
+                    destination = eee->supernode;
+                }
+                else
+                {
+                    destination = r_dest; /* for the trace line only */
                 }
             }
         }
@@ -3481,10 +3438,22 @@ static int send_PACKET( n2n_edge_t * eee,
             }
             ++(eee->tx_sup); eee->super_tx_bytes += pktlen;
         }
-    } else if ( relay_mode == RELAY_USE ) {
-        /* Proven peer relay R carries the traffic alone; same wire format
-         * as for the sn (relay-bound frames are always legacy). */
-        sendto_sock( sock_for_dest(eee, &destination), pktbuf, pktlen, &destination );
+    } else if ( rmode != RELAY_NONE ) {
+        /* Peer-relay path. PROBE: keep the sn copy AND test the relay; USE:
+         * path proven end to end, send to the relay only. The frame header is
+         * legacy so the relay can rebuild it. */
+        if ( rmode == RELAY_PROBE )
+        {
+            if (edge_send_to_sn(eee, pktbuf, pktlen) <= 0) {
+                if (++eee->sn_relay_fails >= 3)
+                    eee->last_register_req = 0;
+            } else {
+                eee->sn_relay_fails = 0;
+            }
+            ++(eee->tx_sup); eee->super_tx_bytes += pktlen;
+        }
+        ++(eee->tx_p2p); eee->p2p_tx_bytes += pktlen;
+        sendto_sock( sock_for_dest(eee, &r_dest), pktbuf, pktlen, &r_dest );
     } else {
         /* Relay via supernode: WS mode uses ws_send, otherwise UDP */
         if (edge_send_to_sn(eee, pktbuf, pktlen) <= 0) {
@@ -3494,18 +3463,12 @@ static int send_PACKET( n2n_edge_t * eee,
         } else {
             eee->sn_relay_fails = 0;
         }
-        if ( relay_mode == RELAY_PROBE ) {
-            /* Unproven assignment: speculative copy to R. The sn copy
-             * above keeps the data path alive if the probe is lost —
-             * a broken R can never blackhole traffic. */
-            sendto_sock( sock_for_dest(eee, &relay_dest), pktbuf, pktlen, &relay_dest );
-            ++(eee->tx_p2p); eee->p2p_tx_bytes += pktlen;
-        }
     }
 
     /* If routing via supernode for a unicast peer, re-register with supernode
-     * and query peer's latest address - triggers full reconnect like a restart. */
-    if ( !dest && !is_multi_broadcast(dstMac) )
+     * and query peer's latest address - triggers full reconnect like a restart.
+     * When a peer relay handles the flow, do not force this churn. */
+    if ( !dest && rmode == RELAY_NONE && !is_multi_broadcast(dstMac) )
     {
         PEERS_LOCK(eee);
         struct peer_info *p = find_peer_by_mac(eee->pending_peers, dstMac);
@@ -3612,23 +3575,15 @@ static void send_packet2net(n2n_edge_t * eee,
     int use_compact = 0;
     PEERS_LOCK( eee );
     {
-        /* Compact frames carry no srcMac or community, so a peer relay "R"
-         * (not in our peer tables) could not rebuild them. Use compact only
-         * when the direct P2P path will be taken — the same conditions as
-         * find_peer_destination. Any mismatch falls back to legacy, which
-         * is always safe (R and sn both accept it). */
-        time_t now = n2n_now();
         struct peer_info *dest = find_peer_by_mac( eee->known_peers, destMac );
         if ( !dest )
             dest = find_peer_by_mac( eee->pending_peers, destMac );
-        if ( dest && dest->compact_capable && dest->last_seen > 0 &&
-             !dest->punch_failed && dest->direct_seen > 0 &&
-             ( now - dest->p2p_est_time ) >= P2P_EST_GRACE &&
-             !( dest->last_probe_sent > 0 &&
-                ( now - dest->direct_seen ) > KEEPALIVE_TOTAL_TIMEOUT ) &&
-             ( ( dest->sock.family == AF_INET && eee->udp_sock != -1 ) ||
-               ( dest->sock6.family == AF_INET6 && eee->udp_sock6 != -1 ) ) )
+        if ( dest && dest->compact_capable )
             use_compact = 1;
+        /* Relay-bound frames must be legacy: the compact header carries no
+         * srcMac, so the relay could not rebuild the frame. */
+        if ( relay_find_dst( eee, destMac, n2n_now() ) != NULL )
+            use_compact = 0;
     }
     PEERS_UNLOCK( eee );
 
@@ -3846,11 +3801,6 @@ static int handle_PACKET( n2n_edge_t * eee,
     time_t              now;
 
     now = n2n_now();
-
-    /* Peer-relay duty first: a frame addressed to another edge we relay
-     * for is forwarded without touching the encrypted payload. */
-    if ( relay_forward( eee, cmn, pkt, payload, psize, orig_sender ) )
-        return 0;
 
     traceEvent( TRACE_DEBUG, "handle_PACKET size %u transform %u",
                 (unsigned int)psize, (unsigned int)pkt->transform );
@@ -4528,14 +4478,17 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
                            (unsigned int)peer_list_size(eee->pending_peers),
                            (unsigned int)peer_list_size(eee->known_peers),
                            sup_str, p2p_str, N2N_NAT_NAME(eee->nat_type));
-        /* One-line reminder in the mgmt window: the user declared -Z 2 but
-         * this edge's NAT type disqualifies it as a relay (the sn silently
-         * ignores such edges during election). */
-        if ( eee->relay_mode == 2 && !n2n_relay_nat_ok( eee->nat_type ) )
-            msg_len += snprintf((char*)udp_buf + msg_len, N2N_PKT_BUF_SIZE - (size_t)msg_len,
-                                " | -Z2 not eligible (%s)", N2N_NAT_NAME(eee->nat_type));
         msg_len += snprintf((char*)udp_buf + msg_len, N2N_PKT_BUF_SIZE - (size_t)msg_len,
                             "\n");
+        /* Remind -Z 2 members whose NAT is not good enough to relay: they ask
+         * to relay but the supernode will never pick them. */
+        if ( eee->relay_mode == N2N_RELAY_MODE_WILLING &&
+             !n2n_relay_nat_ok( eee->nat_type ) )
+        {
+            msg_len += snprintf((char*)udp_buf + msg_len, N2N_PKT_BUF_SIZE - (size_t)msg_len,
+                                " | -Z2 not eligible (nat %s)\n",
+                                N2N_NAT_NAME( eee->nat_type ));
+        }
     }
     sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
            (struct sockaddr*) &sender_sock, i);
@@ -4800,9 +4753,6 @@ process_n2n_packet:
         msg_type = cmn.pc;
         from_supernode = cmn.flags & N2N_FLAGS_FROM_SUPERNODE;
 
-        /* Relayed frames arrive from the relay's address; the srcMac is
-         * resolved below (compact_srcMac), then full-path evidence is noted. */
-
         if ( msg_type != MSG_TYPE_PACKET )
             return 0;
 
@@ -4882,17 +4832,6 @@ process_n2n_packet:
                    sock_to_cstr(sockbuf1, &sender),
                    sock_to_cstr(sockbuf2, orig_sender) );
 
-        /* Full-path evidence: a PACKET that arrived from the relay's address
-         * whose source MAC is the relayed endpoint. Noted only for PACKETs
-         * (relay frames); other messages from relay_sock (P2P keepalives) are
-         * deliberately ignored so a half-open direct A<->R never fakes it. */
-        if ( from_supernode )
-        {
-            PEERS_LOCK( eee );
-            relay_note_via( eee, &sender, compact_srcMac, n2n_now() );
-            PEERS_UNLOCK( eee );
-        }
-
         handle_PACKET( eee, &cmn, &compact_pkt, orig_sender, udp_buf + idx, recvlen - idx );
         traceEvent(TRACE_DEBUG, "handle_PACKET returned (compact)");
         return 1;
@@ -4927,17 +4866,22 @@ process_n2n_packet:
                 orig_sender = &(pkt.sock);
             }
 
-            /* Full-path evidence (see comment in the compact path above). */
-            if ( from_supernode )
-            {
-                PEERS_LOCK( eee );
-                relay_note_via( eee, &sender, pkt.srcMac, now );
-                PEERS_UNLOCK( eee );
-            }
-
             traceEvent(TRACE_DEBUG, "Rx PACKET from %s (%s)",
                        sock_to_cstr(sockbuf1, &sender),
                        sock_to_cstr(sockbuf2, orig_sender) );
+
+            /* If this node is the assigned relay for the frame's destination,
+             * forward it verbatim instead of delivering it locally. */
+            if ( relay_forward( eee, &cmn, &pkt, &sender, udp_buf + idx, recvlen - idx, now ) )
+            {
+                return 1;
+            }
+
+            /* A frame that reached us via a peer relay whose virtual origin is
+             * the peer we send toward through it is end-to-end proof. Capture
+             * it (harmless no-op for sn-relayed and direct frames). */
+            if ( from_supernode )
+                relay_note_via( eee, &sender, orig_sender, now );
 
             handle_PACKET( eee, &cmn, &pkt, orig_sender, udp_buf + idx, recvlen - idx );
             traceEvent(TRACE_DEBUG, "handle_PACKET returned");
@@ -5394,28 +5338,24 @@ process_n2n_packet:
         }
         else if(msg_type == n2n_relay_assign)
         {
-            /* Peer-relay assignment: only trusted from the current
-             * supernode (FROM_SUPERNODE flag alone is not enough — any
-             * edge could set it). */
-            n2n_RELAY_ASSIGN_t ras;
-
-            if ( from_supernode && sock_equal( &sender, &eee->supernode ) == 0 )
+            /* Supernode assigned a relay for a destination (sender role), or
+             * named this node as the relay for a destination (relay role). */
+            if ( from_supernode )
             {
-                decode_RELAY_ASSIGN( &ras, &cmn, udp_buf, &rem, &idx );
-                handle_relay_assign( eee, &ras );
+                n2n_RELAY_ASSIGN_t asgn;
+                decode_RELAY_ASSIGN( &asgn, &cmn, udp_buf, &rem, &idx );
+                handle_relay_assign( eee, &asgn, now );
             }
         }
         else if(msg_type == n2n_relay_ready)
         {
-            /* sn->edge "ready": the confirmed relay C holds BOTH directs, so
-             * a full A--R--B offload is permitted. Trust only our sn. */
-            n2n_RELAY_READY_t rry;
-
-            if ( from_supernode && sock_equal( &sender, &eee->supernode ) == 0 )
-            {
-                decode_RELAY_READY( &rry, &cmn, udp_buf, &rem, &idx );
-                handle_relay_ready( eee, &rry );
-            }
+            /* Either the relay's feasibility report (relay -> sn, to be
+             * handled by the sn) or the sn echoing the "go-ahead" to the
+             * endpoints (sn -> edge, feasible==1) / a "cannot" verdict. */
+            n2n_RELAY_READY_t rdy;
+            decode_RELAY_READY( &rdy, &cmn, udp_buf, &rem, &idx );
+            if ( from_supernode )
+                handle_relay_ready( eee, &rdy, now );
         }
         else if(msg_type == MSG_TYPE_REGISTER_SUPER_NAK)
         {
@@ -6989,6 +6929,12 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
             eee.local_port = (uint16_t)local_port;
             break;
 
+        case 'Z': /* relay a third member's traffic? 0=refuse 1=auto 2=willing */
+            eee.relay_mode = (uint8_t)atoi(optarg);
+            if (eee.relay_mode > N2N_RELAY_MODE_WILLING)
+                eee.relay_mode = N2N_RELAY_MODE_WILLING;
+            break;
+
         case 't':
             if (optarg[0] == '/') {
                 mgmt_port = 0;
@@ -7041,14 +6987,6 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
 
         case 'G': /* Gaming mode: actively probe all peers on start */
             eee.enable_gaming_mode = 1;
-            break;
-
-        case 'Z': /* Peer-relay willingness: 0=refuse 1=auto 2=willing */
-            eee.relay_mode = atoi(optarg);
-            if (eee.relay_mode < 0 || eee.relay_mode > 2) {
-                fprintf(stderr, "Error: -Z must be 0 (refuse), 1 (auto) or 2 (willing)\n");
-                exit(1);
-            }
             break;
 
         } /* end switch */
@@ -7885,6 +7823,7 @@ static int run_loop(n2n_edge_t * eee )
 
         PEERS_LOCK(eee);
         check_keepalive(eee, nowTime);
+        relay_periodic(eee, nowTime);
 
         /* "f" sync cleanup: after 2s, remove peers in pending_peers that
          * were in the snapshot but NOT confirmed by supernode. */
