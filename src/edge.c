@@ -83,7 +83,8 @@
 #define SOCKSTR_TMP(var)     n2n_sock_str_t var; memset(var, 0, sizeof(var))
 
 /* Format a peer identifier: virtual IP if known, otherwise MAC address.
- * buf must be at least INET_ADDRSTRLEN bytes; macstr_t (18 bytes) is sufficient. */
+ * buf must be at least N2N_MACSTR_SIZE (32) bytes (peer_id_str_impl falls back
+ * to macaddr_str when there is no assigned IP). */
 #define PEER_ID(buf, peer) peer_id_str_impl((buf), (peer)->assigned_ip, (peer)->mac_addr)
 static inline const char * peer_id_str_impl(char *buf, uint32_t assigned_ip, const uint8_t *mac) {
     if (assigned_ip != 0) {
@@ -2244,7 +2245,7 @@ void set_peer_operational( n2n_edge_t * eee,
         if (memcmp(scan->mac_addr, eee->last_p2p_log_mac, N2N_MAC_SIZE) ||
             memcmp(peer, &eee->last_p2p_log_addr, sizeof(n2n_sock_t))) {
             /* New P2P connection or address changed — log it */
-            char mac_buf[18];
+            macstr_t mac_buf;
             n2n_sock_str_t sockbuf;
             traceEvent( TRACE_NORMAL, "P2P direct with %s at %s",
                         PEER_ID(mac_buf, scan), sock_to_cstr( sockbuf, peer ) );

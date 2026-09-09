@@ -1926,6 +1926,7 @@ static void sn_relay_apply( n2n_sn_t * sss, sn_relay_entry_t * e,
     e->ever_feasible = 0;
     e->assigned = now;
     e->done = 0;
+    e->notify_sent = now;
     /* sender roles: "traffic to the far end goes via R" */
     if ( a ) sn_relay_assign_one( sss, a, R->mac_addr, &R->sock, e->e2, RELAY_LIFETIME, community );
     if ( b ) sn_relay_assign_one( sss, b, R->mac_addr, &R->sock, e->e1, RELAY_LIFETIME, community );
@@ -1937,6 +1938,40 @@ static void sn_relay_apply( n2n_sn_t * sss, sn_relay_entry_t * e,
     if ( b ) sn_relay_push_peer( sss, b, R, community );
     if ( a ) sn_relay_push_peer( sss, R, a, community );
     if ( b ) sn_relay_push_peer( sss, R, b, community );
+}
+
+/* Re-send the assignment + punching packets for an already-chosen relay,
+ * WITHOUT resetting proven / observation state (unlike sn_relay_apply). UDP is
+ * lossy: if the first delivery of any of these datagrams was lost, the pair
+ * would silently stay on the sn relay forever — periodic refresh repairs it. */
+static void sn_relay_resend( n2n_sn_t * sss, sn_relay_entry_t * e,
+                             struct peer_info * R, const n2n_community_t community )
+{
+    struct peer_info * a = find_peer_by_mac( sss->edges, e->e1 );
+    struct peer_info * b = find_peer_by_mac( sss->edges, e->e2 );
+    if ( a ) sn_relay_assign_one( sss, a, R->mac_addr, &R->sock, e->e2, RELAY_LIFETIME, community );
+    if ( b ) sn_relay_assign_one( sss, b, R->mac_addr, &R->sock, e->e1, RELAY_LIFETIME, community );
+    sn_relay_assign_one( sss, R, R->mac_addr, &R->sock, e->e1, RELAY_LIFETIME, community );
+    sn_relay_assign_one( sss, R, R->mac_addr, &R->sock, e->e2, RELAY_LIFETIME, community );
+    if ( a ) sn_relay_push_peer( sss, a, R, community );
+    if ( b ) sn_relay_push_peer( sss, b, R, community );
+    if ( a ) sn_relay_push_peer( sss, R, a, community );
+    if ( b ) sn_relay_push_peer( sss, R, b, community );
+}
+
+/* Free relay-pair records that saw no traffic for N2N_SN_RELAY_TTL. The table
+ * is bounded; without reclamation it would fill up and strand new pairs once
+ * N2N_SN_RELAY_MAX is reached, and stale done/unavailable state would linger
+ * forever. */
+static void sn_relay_reclaim( n2n_sn_t * sss, time_t now )
+{
+    int i;
+    for ( i = 0; i < N2N_SN_RELAY_MAX; i++ )
+    {
+        sn_relay_entry_t * e = &sss->relays[i];
+        if ( e->valid && ( now - e->last_used ) >= N2N_SN_RELAY_TTL )
+            memset( e, 0, sizeof(*e) );
+    }
 }
 
 /* Echo "the path through R is usable" to BOTH endpoints. */
@@ -1984,7 +2019,7 @@ static void sn_relay_handle_ready( n2n_sn_t * sss, const n2n_common_t * cmn,
         R = sn_relay_current( sss, e );
         if ( !R || memcmp( R->mac_addr, m->relay_mac, N2N_MAC_SIZE ) != 0 )
             continue; /* stale answer from a relay we already dropped */
-        other = ( memcmp( e->e1, m->dst_mac, N2N_MAC_SIZE ) == 0 ) ? e->e2 : e->e1;
+        memcpy( other, ( memcmp( e->e1, m->dst_mac, N2N_MAC_SIZE ) == 0 ) ? e->e2 : e->e1, N2N_MAC_SIZE );
         if ( m->feasible )
         {
             e->feasible = 1;
@@ -2035,9 +2070,16 @@ static void sn_relay_on_packet( n2n_sn_t * sss, const n2n_common_t * cmn,
     if ( e->done ) return;
     if ( sn_relay_current( sss, e ) != NULL )
     {
-        /* a relay is chosen and still present. Once proven it never moves;
+        /* A relay is chosen and still present. Once proven it never moves;
          * until proven, leave it to observe (re-applying would reset the
-         * edges' observation and delay the verdict). */
+         * edges' observation and delay the verdict). Re-send the assignment
+         * and punching packets on a throttle so a lost first delivery (UDP)
+         * does not silently strand the pair on the sn relay forever. */
+        if ( now - e->notify_sent >= N2N_SN_RELAY_REFRESH )
+        {
+            e->notify_sent = now;
+            sn_relay_resend( sss, e, e->r, cmn->community );
+        }
         return;
     }
     R = sn_relay_pick( sss, e, cmn->community, now );
@@ -4490,6 +4532,10 @@ static int run_loop( n2n_sn_t * sss )
 
         /* Deferred full-cone N2NF probes (#2/#3, staggered). */
         fc_probes_tick( sss, now );
+
+        /* Reclaim idle relay-pair records so the bounded table keeps recycling
+         * slots for fresh pairs. */
+        sn_relay_reclaim( sss, now );
 
         /* sn1 -> sn2 brother_reg, every 31s. */
         if (sss->backup_addr_text[0])
