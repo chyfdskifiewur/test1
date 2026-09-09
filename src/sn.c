@@ -3366,6 +3366,7 @@ static int process_udp( n2n_sn_t * sss,
             n2n_sn_relay_t * ra = sn_relay_find( sss, rdy.src_mac, rdy.dst_mac, n2n_now() );
             struct peer_info * pa = find_peer_by_mac( sss->edges, rdy.src_mac );
             struct peer_info * pb = find_peer_by_mac( sss->edges, rdy.dst_mac );
+            macstr_t mac_buf3;
 
             if ( ra && ra->assigned &&
                  memcmp( ra->r, rdy.relay_mac, N2N_MAC_SIZE ) == 0 )
