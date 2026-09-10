@@ -3410,6 +3410,7 @@ static int handle_PACKET( n2n_edge_t * eee,
                           const n2n_common_t * cmn,
                           const n2n_PACKET_t * pkt,
                           const n2n_sock_t * orig_sender,
+                          const n2n_sock_t * tx_sender,
                           uint8_t * payload,
                           size_t psize )
 {
@@ -4491,7 +4492,7 @@ process_n2n_packet:
                    sock_to_cstr(sockbuf1, &sender),
                    sock_to_cstr(sockbuf2, orig_sender) );
 
-        handle_PACKET( eee, &cmn, &compact_pkt, orig_sender, udp_buf + idx, recvlen - idx );
+        handle_PACKET( eee, &cmn, &compact_pkt, orig_sender, &sender, udp_buf + idx, recvlen - idx );
         traceEvent(TRACE_DEBUG, "handle_PACKET returned (compact)");
         return 1;
     }
