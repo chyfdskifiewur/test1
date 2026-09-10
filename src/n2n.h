@@ -303,6 +303,7 @@ typedef struct n2n_relay_entry {
     time_t      last_via;       /* last full-path frame received VIA the relay
                                  * whose src was dst_mac (proof the relay works) */
     time_t      last_try;       /* pacing of probe sends toward the relay */
+    uint8_t     notified_use;   /* sender role: the "relay confirmed" line was logged */
     /* relay role */
     uint8_t     feasible;       /* last opinion this node keeps for the pair */
     uint8_t     obs_done;       /* observation window done */

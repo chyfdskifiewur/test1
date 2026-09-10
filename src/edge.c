@@ -3052,6 +3052,20 @@ static int relay_rt_find( n2n_edge_t * eee, const n2n_mac_t mac, n2n_sock_t * ou
     return 0;
 }
 
+/* Readable id for the relay log lines: virtual IP when we know the peer,
+ * else the address the assignment carries, else the MAC. buf >= 64 bytes. */
+static const char * relay_id( char * buf, n2n_edge_t * eee,
+                              const n2n_mac_t mac, const n2n_sock_t * sock )
+{
+    struct peer_info * p = find_peer_by_mac( eee->pending_peers, mac );
+    if ( !p ) p = find_peer_by_mac( eee->known_peers, mac );
+    if ( p && p->assigned_ip != 0 )
+        return peer_id_str_impl( buf, p->assigned_ip, p->mac_addr );
+    if ( sock && sock->family != AF_UNSPEC )
+        return sock_to_cstr( buf, sock );
+    return macaddr_str( buf, mac );
+}
+
 /* sender-side send decision for a destination that has a relay assigned.
  * Returns RELAY_NONE/USE/PROBE and, for the relay paths, the address to reach
  * the relay (preferring the direct address we hold for it). */
@@ -3070,6 +3084,14 @@ static int relay_find_dest( n2n_edge_t * eee, const n2n_mac_t dst, n2n_sock_t * 
      * sn copy switched off. Prefer the direct address we hold for the relay. */
     if ( r->ready && r->last_via != 0 && ( now - r->last_via ) <= RELAY_DEAD_SECS )
     {
+        if ( !r->notified_use )
+        {
+            char idr[N2N_SOCKBUF_SIZE], idd[N2N_SOCKBUF_SIZE];
+            r->notified_use = 1;
+            traceEvent( TRACE_NORMAL, "relay %s confirmed for %s",
+                        relay_id( idr, eee, r->relay_mac, NULL ),
+                        relay_id( idd, eee, r->dst_mac, NULL ) );
+        }
         rp = find_peer_by_mac( eee->known_peers, r->relay_mac );
         if ( rp && rp->sock.family != 0 ) *dest = rp->sock;
         else *dest = r->relay_sock;
@@ -3165,6 +3187,12 @@ static void relay_report_roles( n2n_edge_t * eee, time_t now )
         /* Fresh forwarded data = the forward path is real: say "feasible". */
         if ( r->last_forward > 0 && ( now - r->last_forward ) < RELAY_DEAD_SECS )
         {
+            if ( r->feasible != 1 )
+            {
+                char idd[N2N_SOCKBUF_SIZE];
+                traceEvent( TRACE_NORMAL, "relaying traffic to %s",
+                            relay_id( idd, eee, r->dst_mac, NULL ) );
+            }
             r->feasible = 1;
             r->obs_done  = 1;
             if ( ( now - r->last_ready_report ) >= 5 )
@@ -3183,9 +3211,12 @@ static void relay_report_roles( n2n_edge_t * eee, time_t now )
                 r->obs_done = 1;
                 if ( ( now - r->last_ready_report ) >= 5 )
                 {
+                    char idd[N2N_SOCKBUF_SIZE];
                     r->last_ready_report = now;
                     r->feasible = 0; /* no data flowed in the window */
                     relay_report_send( eee, r );
+                    traceEvent( TRACE_NORMAL, "no relay path to %s, reported to sn",
+                                relay_id( idd, eee, r->dst_mac, NULL ) );
                 }
             }
             continue;
@@ -3278,6 +3309,7 @@ static void handle_relay_assign( n2n_edge_t * eee, const n2n_RELAY_ASSIGN_t * a,
     n2n_relay_entry_t * r = NULL;
     int i, free_slot = -1;
     uint16_t lifetime = a->lifetime ? a->lifetime : 240;
+    uint8_t fresh = 0, changed = 0;
 
     /* relay_table is also read by the TAP thread under PEERS_LOCK
      * (send_PACKET), so writes here take the same lock. */
@@ -3297,22 +3329,45 @@ static void handle_relay_assign( n2n_edge_t * eee, const n2n_RELAY_ASSIGN_t * a,
         r = &eee->relay_table[free_slot];
         memset( r, 0, sizeof(*r) );
         r->valid = 1;
+        fresh = 1;
     }
+    else
+        changed = ( memcmp( r->relay_mac, a->relay_mac, N2N_MAC_SIZE ) != 0 );
 
     memcpy( r->relay_mac, a->relay_mac, N2N_MAC_SIZE );
     r->relay_sock = a->relay_sock;
     memcpy( r->dst_mac, a->dst_mac, N2N_MAC_SIZE );
     r->expires = now + lifetime;
 
-    /* fresh assignment resets both sender and relay observation state */
-    r->ready = 0;
-    r->last_via = 0;
-    r->last_try = 0;
-    r->feasible = 0;
-    r->obs_done = 0;
-    r->obs_start = now;
-    r->last_forward = 0;
-    r->last_ready_report = 0;
+    if ( fresh || changed )
+    {
+        /* A new relay restarts sender and relay observation state. A repeat of
+         * the same assignment only refreshes the lease: the sn re-sends it
+         * periodically and must not wipe proof we are still collecting. */
+        r->ready = 0;
+        r->last_via = 0;
+        r->last_try = 0;
+        r->feasible = 0;
+        r->obs_done = 0;
+        r->obs_start = now;
+        r->last_forward = 0;
+        r->last_ready_report = 0;
+        r->notified_use = 0;
+
+        if ( memcmp( a->relay_mac, eee->device.mac_addr, N2N_MAC_SIZE ) == 0 )
+        {
+            char idd[N2N_SOCKBUF_SIZE];
+            traceEvent( TRACE_NORMAL, "sn: relay duty for %s",
+                        relay_id( idd, eee, a->dst_mac, NULL ) );
+        }
+        else
+        {
+            char idr[N2N_SOCKBUF_SIZE], idd[N2N_SOCKBUF_SIZE];
+            traceEvent( TRACE_NORMAL, "sn: try relay %s for %s",
+                        relay_id( idr, eee, a->relay_mac, &a->relay_sock ),
+                        relay_id( idd, eee, a->dst_mac, NULL ) );
+        }
+    }
     PEERS_UNLOCK( eee );
 }
 
@@ -3347,7 +3402,20 @@ static void relay_periodic( n2n_edge_t * eee, time_t now )
     for ( i = 0; i < N2N_EDGE_RELAY_MAX; i++ )
     {
         n2n_relay_entry_t * r = &eee->relay_table[i];
-        if ( !r->valid || now < r->expires ) continue;
+        if ( !r->valid ) continue;
+        /* Sender-role: announce the fall-back as soon as the full-path proof
+         * ages out (or the sn echoed "cannot"), not only when the entry dies. */
+        if ( memcmp( r->relay_mac, eee->device.mac_addr, N2N_MAC_SIZE ) != 0 &&
+             r->notified_use &&
+             !( r->ready && r->last_via != 0 && ( now - r->last_via ) <= RELAY_DEAD_SECS ) )
+        {
+            char idr[N2N_SOCKBUF_SIZE], idd[N2N_SOCKBUF_SIZE];
+            traceEvent( TRACE_NORMAL, "relay %s lost for %s, back on sn",
+                        relay_id( idr, eee, r->relay_mac, NULL ),
+                        relay_id( idd, eee, r->dst_mac, NULL ) );
+            r->notified_use = 0;
+        }
+        if ( now < r->expires ) continue;
         /* An actively used path must not be reclaimed while it flows: keep the
          * entry alive for the sender-role when the sn echoed usable and we are
          * still receiving proof, and for the relay-role while it forwards. An
