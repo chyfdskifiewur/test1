@@ -523,13 +523,15 @@ struct n2n_edge
 
     /* R-RELAY client: community relay R (mini-SN). Set when SN advertises R
      * (PEER_INFO with N2N_AFLAGS_RELAY). While active, the edge registers to R
-     * so R learns our socket, and packets whose direct path is not up are sent
-     * to R instead of the supernode. Cleared once a direct P2P link is
+     * so R learns our socket, and packets whose direct path is not up are
+     * dual-sent to R and the supernode until a frame returns through R
+     * (relay_proven), then sent to R only. Cleared once a direct P2P link is
      * established (no more relaying needed). */
     n2n_mac_t           relay_mac;
     n2n_sock_t          relay_sock;
     uint8_t             relay_valid;
     time_t              relay_last_reg;
+    time_t              relay_proven;   /* last time a frame was received THROUGH relay R; 0=never */
 
     /* R-RELAY server: when set, this edge acts as R and forwards PACKETs
      * addressed to a peer that registered to it (mini-SN). Only a "good" peer

@@ -1799,6 +1799,7 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
 #define KEEPALIVE_MAX_FAILS       3   /* fall back to relay after this many consecutive failures */
 #define KEEPALIVE_TOTAL_TIMEOUT   (KEEPALIVE_IDLE_SECONDS + KEEPALIVE_RETRY_INTERVAL * KEEPALIVE_MAX_FAILS)  /* 14s */
 #define P2P_EST_GRACE           1    /* sec: after P2P established, keep relay for this long */
+#define RELAY_PROVEN_SECS      15    /* a frame received through R this recently proves the relay path */
 
 static void update_peer_address(n2n_edge_t * eee,
                                 uint8_t from_supernode,
@@ -2005,6 +2006,7 @@ static void check_relay( n2n_edge_t * eee, time_t now )
         PEERS_UNLOCK(eee);
         if (scan) { /* some P2P data path is up -> no more relaying needed */
             eee->relay_valid = 0;
+            eee->relay_proven = 0;
             return;
         }
     }
@@ -3061,14 +3063,22 @@ static int send_PACKET( n2n_edge_t * eee,
             ++(eee->tx_sup); eee->super_tx_bytes += pktlen;
         }
     } else {
-        /* Relay via supernode OR via community relay R (mini-SN). */
+        /* No direct P2P: when a community relay R is assigned, dual-send —
+         * via R, keeping the supernode copy as fallback until a frame actually
+         * comes back through R (relay_proven); once proven, relay-only.
+         * Without R, the supernode carries the traffic. */
         int via_relay = (eee->relay_valid && !is_multi_broadcast(dstMac));
         ssize_t r = -1;
-        if (via_relay)
+        if (via_relay) {
             r = sendto_sock( sock_for_dest(eee, &eee->relay_sock),
                              pktbuf, pktlen, &eee->relay_sock );
-        if (r <= 0) {
-            /* Direct fails and R is absent/failed: go via supernode. */
+            if (r > 0)
+                eee->sn_relay_fails = 0;
+        }
+        int proven = ( eee->relay_proven != 0 &&
+                       (now - eee->relay_proven) <= RELAY_PROVEN_SECS );
+        if (!proven || r <= 0) {
+            /* Not proven yet, or R failed: keep the supernode copy. */
             if (edge_send_to_sn(eee, pktbuf, pktlen) <= 0) {
                 /* Consecutive failures trigger supernode re-registration */
                 if (++eee->sn_relay_fails >= 3)
@@ -3076,8 +3086,6 @@ static int send_PACKET( n2n_edge_t * eee,
             } else {
                 eee->sn_relay_fails = 0;
             }
-        } else {
-            eee->sn_relay_fails = 0;
         }
     }
 
@@ -3456,12 +3464,17 @@ static int handle_PACKET( n2n_edge_t * eee,
         return retval;
     }
 
-    /* R-RELAY: a PACKET delivered by relay R (originating from our relay_sock)
-     * is a *relayed* frame, not proof of a direct A-B link. Classify it like a
-     * supernode-relayed frame below so we never mis-mark the data peer as
-     * directly connected (which would disarm the relay / black-hole traffic). */
-    uint8_t from_relay = ( eee->relay_valid && orig_sender &&
-                        sock_equal( &eee->relay_sock, orig_sender ) == 0 ) ? 1 : 0;
+    /* R-RELAY: a PACKET whose transport source is relay R is a *relayed* frame
+     * (R forwards the payload untouched; the header's embedded sock is the
+     * original sender, so only the transport source identifies R). Classify it
+     * like a supernode-relayed frame below so we never mis-mark the data peer
+     * as directly connected (which would disarm the relay / black-hole
+     * traffic). A frame reaching us through R also proves the relay path end
+     * to end — the sender may then drop the supernode copy. */
+    uint8_t from_relay = ( eee->relay_valid && tx_sender &&
+                        sock_equal( &eee->relay_sock, tx_sender ) == 0 ) ? 1 : 0;
+    if (from_relay)
+        eee->relay_proven = now;
 
     if (from_supernode) {
         ++(eee->rx_sup);
@@ -4516,7 +4529,7 @@ process_n2n_packet:
                        sock_to_cstr(sockbuf1, &sender),
                        sock_to_cstr(sockbuf2, orig_sender) );
 
-            handle_PACKET( eee, &cmn, &pkt, orig_sender, udp_buf + idx, recvlen - idx );
+            handle_PACKET( eee, &cmn, &pkt, orig_sender, &sender, udp_buf + idx, recvlen - idx );
             traceEvent(TRACE_DEBUG, "handle_PACKET returned");
         }
         else if(msg_type == MSG_TYPE_REGISTER)
