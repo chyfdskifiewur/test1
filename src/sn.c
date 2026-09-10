@@ -2047,17 +2047,19 @@ static void sn_relay_handle_ready( n2n_sn_t * sss, const n2n_common_t * cmn,
     }
 }
 
-/* Called for every unicast data frame the sn relays. Ensures the pair has a
- * live relay; once proven, the assignment is kept sticky (only a dropped
- * candidate or a never-proven "cannot" triggers a (re)election). */
-static void sn_relay_on_packet( n2n_sn_t * sss, const n2n_common_t * cmn,
-                                const n2n_mac_t src, const n2n_mac_t dst, time_t now )
+/* Ensure a src->dst pair has a live relay chosen, pushing the assignment and
+ * punching PEER_INFOs so 33/11/R all hole-punch toward each other. Called from
+ * BOTH a QUERY_PEER (33 announces it wants to reach 11 — the earliest "need"
+ * signal, before any data flows) and the unicast data path (try_forward).
+ * Once proven, the assignment is kept sticky (only a dropped candidate or a
+ * never-proven "cannot" triggers a (re)election). */
+static void sn_relay_ensure_pair( n2n_sn_t * sss, const n2n_common_t * cmn,
+                                  const n2n_mac_t src, const n2n_mac_t dst, time_t now )
 {
     struct peer_info * R;
     sn_relay_entry_t * e;
     struct peer_info * sp, * dp;
     macstr_t mb;
-    if ( cmn->pc != n2n_packet ) return;
     if ( memcmp( src, dst, N2N_MAC_SIZE ) == 0 ) return;
     sp = find_peer_by_mac( sss->edges, src );
     dp = find_peer_by_mac( sss->edges, dst );
@@ -2165,10 +2167,10 @@ static int try_forward( n2n_sn_t * sss,
         return 0;
     }
 
-    /* Peer-relay: ensure this pair has a live relay chosen (only the sn-routed
-     * unicast data path does this; REGISTER/ACK frames never trigger it). */
+    /* Peer-relay: ensure this pair has a live relay chosen (the unicast data
+     * path also feeds it; the QUERY_PEER sees it earlier, before data flows). */
     if ( cmn->pc == n2n_packet )
-        sn_relay_on_packet( sss, cmn, srcMac, dstMac, now );
+        sn_relay_ensure_pair( sss, cmn, srcMac, dstMac, now );
 
     /* Rate limiting check (after destination lookup) */
     if (sss->traffic_stats_enabled) {
@@ -3512,6 +3514,13 @@ static int process_udp( n2n_sn_t * sss,
                 }
             }
         }
+
+        /* A QUERY_PEER is the earliest, most reliable "33 wants to reach 11"
+         * signal — it fires before any data flows, so the sn can pick a relay
+         * and push the punching PEER_INFOs immediately instead of waiting for
+         * the first unicast data frame (which may never be sn-routed once a
+         * direct 33<->R path forms). */
+        sn_relay_ensure_pair( sss, &cmn, query.srcMac, query.targetMac, now );
     }
     else if ( msg_type == MSG_TYPE_REGISTER_SUPER )
     {
