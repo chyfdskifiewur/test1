@@ -2953,6 +2953,8 @@ static const struct option long_options[] = {
 #define RELAY_RETRY_SECS  60   /* throttle: how often to talk to the supernode */
 #define RELAY_UPDATE_SECS 15   /* relaying observation window length */
 #define RELAY_LIFETIME    240  /* sn assignment validity; active paths extend on use */
+#define RELAY_REG_SECS    30   /* relay role: how often to REGISTER the far endpoint to
+                                * keep the NAT mapping data flows on alive */
 
 /* find_peer_by_sock wrapper accepting an n2n_sock_t (v4 or v6). */
 static struct peer_info * relay_peer_by_sock( n2n_edge_t * eee, const n2n_sock_t * s )
@@ -3147,6 +3149,40 @@ static void relay_note_via( n2n_edge_t * eee, const n2n_sock_t * sender,
         if ( first >= 0 ) eee->relay_table[first].last_via = now;
     }
     PEERS_UNLOCK( eee );
+}
+
+/* Periodic REGISTER toward every far endpoint this node actively relays for.
+ * Modeled on the supernode/edge A-B registration: a keepalive toward the same
+ * destination as the forwarded data rides the same NAT mapping, so it both
+ * keeps our outbound mapping alive and makes a strict endpoint relearn our
+ * source port. Works equally for any unknown endpoint (no per-peer special
+ * casing). Called from relay_periodic under PEERS_LOCK. */
+static void relay_ping_endpoints( n2n_edge_t * eee, time_t now )
+{
+    int i;
+    for ( i = 0; i < N2N_EDGE_RELAY_MAX; i++ )
+    {
+        n2n_relay_entry_t * r = &eee->relay_table[i];
+        if ( !r->valid ) continue;
+        if ( memcmp( r->relay_mac, eee->device.mac_addr, N2N_MAC_SIZE ) != 0 )
+            continue; /* sender-role entry, not mine to keep the mapping alive */
+        if ( r->last_forward == 0 || ( now - r->last_forward ) >= RELAY_LIFETIME )
+            continue; /* not (currently) serving this endpoint: let the mapping rest */
+        if ( ( now - r->last_reg ) < RELAY_REG_SECS )
+            continue;
+        /* Where to reach the endpoint: its freshest inbound socket (learned
+         * from frames it sent through us), else its registered address. */
+        n2n_sock_t ep;
+        memset( &ep, 0, sizeof(ep) );
+        if ( !relay_rt_find( eee, r->dst_mac, &ep, now ) )
+        {
+            struct peer_info * dp = find_peer_by_mac( eee->known_peers, r->dst_mac );
+            if ( dp && dp->sock.family != 0 ) ep = dp->sock;
+            else continue;
+        }
+        r->last_reg = now;
+        send_register( eee, &ep );
+    }
 }
 
 /* Send a RELAY_READY report (relay side) to the supernode: either "this pair
@@ -3441,6 +3477,7 @@ static void relay_periodic( n2n_edge_t * eee, time_t now )
         memset( r, 0, sizeof( *r ) );
     }
     relay_report_roles( eee, now );
+    relay_ping_endpoints( eee, now );
     PEERS_UNLOCK( eee );
 }
 

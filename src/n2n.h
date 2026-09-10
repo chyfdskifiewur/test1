@@ -310,6 +310,10 @@ typedef struct n2n_relay_entry {
     time_t      obs_start;      /* observation window start (after punching) */
     time_t      last_forward;   /* last time data was relayed for this pair */
     time_t      last_ready_report; /* throttle: how often to tell the supernode */
+    time_t      last_reg;       /* pacing: periodic REGISTER toward the far endpoint
+                                 * to keep the NAT mapping we forward data on alive
+                                 * (the sn-style A-B registration model, general for
+                                 * any unknown endpoint, not specific to this peer) */
 } n2n_relay_entry_t;
 
 /* Return-path cache used by the RELAY role: for each endpoint it serves, keep
