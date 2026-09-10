@@ -1941,11 +1941,14 @@ static void sn_relay_apply( n2n_sn_t * sss, sn_relay_entry_t * e,
     /* relay roles: R itself forwards BOTH directions */
     sn_relay_assign_one( sss, R, R->mac_addr, &R->sock, e->e1, RELAY_LIFETIME, community );
     sn_relay_assign_one( sss, R, R->mac_addr, &R->sock, e->e2, RELAY_LIFETIME, community );
-    /* punching setup: both endpoints learn R, and R learns both endpoints */
+    /* punching setup: both endpoints learn R. R itself does NOT get the
+     * endpoints' sn-observed addresses — under the mini-sn model R learns each
+     * endpoint's usable mapping from the endpoint's own REGISTER toward R
+     * (relay_reg_toward_relay), which is the only address guaranteed to reach
+     * it through R. Pushing the sn-observed/punch address to R would clobber
+     * that REGISTER-fed address and break forwarding for strict NAT endpoints. */
     if ( a ) sn_relay_push_peer( sss, a, R, community );
     if ( b ) sn_relay_push_peer( sss, b, R, community );
-    if ( a ) sn_relay_push_peer( sss, R, a, community );
-    if ( b ) sn_relay_push_peer( sss, R, b, community );
 }
 
 /* Re-send the assignment + punching packets for an already-chosen relay,
@@ -1961,10 +1964,11 @@ static void sn_relay_resend( n2n_sn_t * sss, sn_relay_entry_t * e,
     if ( b ) sn_relay_assign_one( sss, b, R->mac_addr, &R->sock, e->e1, RELAY_LIFETIME, community );
     sn_relay_assign_one( sss, R, R->mac_addr, &R->sock, e->e1, RELAY_LIFETIME, community );
     sn_relay_assign_one( sss, R, R->mac_addr, &R->sock, e->e2, RELAY_LIFETIME, community );
+    /* Like sn_relay_apply: only endpoints learn R (fresh punch picture each
+     * refresh); R is NOT fed the endpoints' sn-observed addresses — it learns
+     * them from the endpoints' own REGISTER toward it (mini-sn model). */
     if ( a ) sn_relay_push_peer( sss, a, R, community );
     if ( b ) sn_relay_push_peer( sss, b, R, community );
-    if ( a ) sn_relay_push_peer( sss, R, a, community );
-    if ( b ) sn_relay_push_peer( sss, R, b, community );
 }
 
 /* Free relay-pair records that saw no traffic for N2N_SN_RELAY_TTL. The table

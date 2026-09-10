@@ -2953,10 +2953,10 @@ static const struct option long_options[] = {
 #define RELAY_RETRY_SECS  60   /* throttle: how often to talk to the supernode */
 #define RELAY_UPDATE_SECS 15   /* relaying observation window length */
 #define RELAY_LIFETIME    240  /* sn assignment validity; active paths extend on use */
-#define RELAY_REG_SECS    30   /* sender role: REGISTER the assigned relay this often,
-                                * like an edge registers with its supernode — keeps the
-                                * NAT mapping the relayed data rides alive on any
-                                * endpoint NAT type, strict ones included */
+#define RELAY_REG_SECS    60    /* AB treat R like a mini-sn: keep the REGISTER keepalive
+                                 * period identical to the sn registration cadence, so the
+                                 * mapping the relayed data rides is maintained the same way
+                                 * a peer maintains its sn mapping */
 
 /* find_peer_by_sock wrapper accepting an n2n_sock_t (v4 or v6). */
 static struct peer_info * relay_peer_by_sock( n2n_edge_t * eee, const n2n_sock_t * s )
@@ -3302,14 +3302,22 @@ static int relay_forward( n2n_edge_t * eee, const n2n_common_t * cmn,
     if ( sender->family != AF_UNSPEC )
         relay_rt_note( eee, pkt->srcMac, sender, now );
 
-    /* Where to forward: the endpoint's freshest inbound socket, else its
-     * registered address. If unknown, drop — the sn copy still delivers. */
+    /* Where to forward. R acts as a mini-sn for its served endpoints: the
+     * authoritative address for a destination is the one the endpoint dials
+     * R with — kept fresh by its periodic REGISTER (relay_reg_toward_relay)
+     * and recorded in known_peers on the REGISTER path. That address is the
+     * only one guaranteed to be the endpoint's NAT-stable mapping toward R.
+     * relay_rt (the last source-packet it forwarded) is a fallback only, it
+     * may hold a stale/other mapping and must never out-rank the REGISTERed
+     * address. If unknown, drop — the sn copy still delivers. */
     memset( &tgt, 0, sizeof(tgt) );
-    if ( !relay_rt_find( eee, pkt->dstMac, &tgt, now ) )
+    struct peer_info * dp = find_peer_by_mac( eee->known_peers, pkt->dstMac );
+    if ( dp && dp->sock.family != 0 && ( now - dp->last_seen ) < RELAY_DEAD_SECS * 4 )
+        tgt = dp->sock;
+    else if ( !relay_rt_find( eee, pkt->dstMac, &tgt, now ) )
     {
-        struct peer_info * dp = find_peer_by_mac( eee->known_peers, pkt->dstMac );
-        if ( dp && dp->sock.family != 0 ) tgt = dp->sock;
-        else { PEERS_UNLOCK( eee ); return 1; }
+        if ( !dp || dp->sock.family == 0 ) { PEERS_UNLOCK( eee ); return 1; }
+        tgt = dp->sock;
     }
 
     if ( cmn->ttl <= 1 ) { PEERS_UNLOCK( eee ); return 1; } /* guard: never loop */
@@ -5250,6 +5258,21 @@ process_n2n_packet:
             PEERS_LOCK(eee);
             struct peer_info *known = find_peer_by_mac(eee->known_peers, pi.mac);
             struct peer_info *pending = find_peer_by_mac(eee->pending_peers, pi.mac);
+
+            /* Mini-sn model: if THIS node is the assigned relay for pi.mac, then
+             * the only address that is guaranteed to reach pi.mac through us is
+             * the one pi.mac dials us with — maintained exclusively by pi.mac's
+             * own periodic REGISTER (relay_reg_toward_relay), which lands in
+             * known_peers on the REGISTER path. Any PEER_INFO the sn pushes here
+             * carries the sn-observed / direct-punch mapping, which for a strict
+             * NAT endpoint is a DIFFERENT (often unreachable) port for us. Letting
+             * it clobber known_peers is exactly what breaks forwarding. So ignore
+             * the sn's address picture for served endpoints entirely. */
+            if ( relay_find_role( eee, pi.mac, now ) != NULL )
+            {
+                PEERS_UNLOCK(eee);
+                return 1;
+            }
 
             /* During "f" sync: remove this peer's IP from snapshot (confirms SN has it) */
             if (eee->peer_sync_active && pi.assigned_ip != 0) {
