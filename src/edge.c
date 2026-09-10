@@ -3114,30 +3114,37 @@ static int relay_find_dest( n2n_edge_t * eee, const n2n_mac_t dst, n2n_sock_t * 
 }
 
 /* Full-path evidence on the sender side: a frame arrived whose transport
- * source is the relay and whose virtual origin is the far endpoint we send
- * toward through that relay. That means A--relay--far-end works end to end. */
+ * source is the relay. That means A--relay--far-end works end to end. The
+ * far-end origin is matched exactly when we hold its sock; symmetric endpoints
+ * however remap their source port per destination, so the relay-observed
+ * origin often matches no sock we hold — the transport sender matching the
+ * relay's own sock is already proof the frame travelled through it. */
 static void relay_note_via( n2n_edge_t * eee, const n2n_sock_t * sender,
                             const n2n_sock_t * virtual_origin, time_t now )
 {
     struct peer_info * relay_peer, * origin_peer;
-    int i;
+    int i, first = -1;
     if ( sender->family == AF_UNSPEC || virtual_origin->family == AF_UNSPEC ) return;
     PEERS_LOCK( eee );
     relay_peer = relay_peer_by_sock( eee, sender );
-    origin_peer = relay_peer_by_sock( eee, virtual_origin );
-    if ( relay_peer && origin_peer )
+    if ( relay_peer )
     {
+        origin_peer = relay_peer_by_sock( eee, virtual_origin );
         for ( i = 0; i < N2N_EDGE_RELAY_MAX; i++ )
         {
             n2n_relay_entry_t * r = &eee->relay_table[i];
-            if ( r->valid && now < r->expires &&
-                 memcmp( r->relay_mac, relay_peer->mac_addr, N2N_MAC_SIZE ) == 0 &&
+            if ( !r->valid || now >= r->expires ) continue;
+            if ( memcmp( r->relay_mac, relay_peer->mac_addr, N2N_MAC_SIZE ) != 0 ) continue;
+            if ( first < 0 ) first = i;
+            if ( origin_peer &&
                  memcmp( r->dst_mac, origin_peer->mac_addr, N2N_MAC_SIZE ) == 0 )
             {
-                r->last_via = now;
+                r->last_via = now; /* exact origin identified */
+                first = -1;
                 break;
             }
         }
+        if ( first >= 0 ) eee->relay_table[first].last_via = now;
     }
     PEERS_UNLOCK( eee );
 }

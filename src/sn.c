@@ -1810,10 +1810,17 @@ static struct peer_info * sn_relay_current( n2n_sn_t * sss, sn_relay_entry_t * e
     return r;
 }
 
-/* Record "this relay cannot carry the pair", evicting the oldest slot. */
+/* Record "this relay cannot carry the pair", evicting the oldest slot.
+ * DISABLED while the verdict mechanism is under verification: we do not
+ * remember "cannot" yet — every re-election re-tests every online candidate,
+ * so a restarted edge always gets a fresh trial. Re-enable once proven. */
 static void sn_relay_remember_unavail( sn_relay_entry_t * e, const n2n_mac_t mac, time_t now )
 {
     int i, oldest = 0, j;
+    (void)e; (void)mac; (void)now;
+    return; /* DISABLED while the verdict mechanism is under verification:
+             * every re-election re-tests every online candidate, so a
+             * restarted edge always gets a fresh trial. Re-enable once proven. */
     for ( i = 0; i < N2N_SN_CANDIDATE_MAX; i++ )
     {
         if ( e->unavailable[i] && memcmp( e->unavailable[i], mac, N2N_MAC_SIZE ) == 0 )
@@ -1905,6 +1912,7 @@ static void sn_relay_push_peer( n2n_sn_t * sss, struct peer_info * to,
     strncpy( pi.version, about->version, sizeof(pi.version) - 1 );
     strncpy( pi.os_name, about->os_name, sizeof(pi.os_name) - 1 );
     pi.assigned_ip = about->assigned_ip;
+    pi.aflags |= N2N_AFLAGS_PUNCH_REQUEST; /* edge stores the address AND fires a REGISTER — without this flag it only caches the address and never punches */
     pi.aflags |= N2N_NAT_AFLAGS( about->nat_type );
     pix = 0;
     encode_PEER_INFO( pibuf, &pix, &pi_cmn, &pi );
@@ -2069,7 +2077,9 @@ static void sn_relay_ensure_pair( n2n_sn_t * sss, const n2n_common_t * cmn,
     e = sn_relay_find( sss, src, dst, now );
     if ( !e ) return;
     e->last_used = now;
-    if ( e->done ) return;
+    /* done check disabled along with the "cannot" memory (see
+     * sn_relay_remember_unavail): never give up on a pair while the verdict
+     * mechanism is being verified — e->done is still written but ignored. */
     if ( sn_relay_current( sss, e ) != NULL )
     {
         /* A relay is chosen and still present. Once proven it never moves;
