@@ -4942,13 +4942,21 @@ process_n2n_packet:
              * address; the normal non-punch handling below also keeps R as a
              * known peer (no direct punch) so we can register to it for relay. */
             if (pi.aflags & N2N_AFLAGS_RELAY) {
+                /* Log only when the relay actually changes (first assign,
+                 * or SN picked a new R). Repeating 15s re-advertisements of
+                 * the same relay are kept silent to avoid log spam. */
+                int relay_changed = ( !eee->relay_valid ||
+                                      eee->relay_sock.port != pi.sockets[0].port ||
+                                      memcmp(eee->relay_sock.addr.v4, pi.sockets[0].addr.v4,
+                                             IPV4_SIZE ) != 0 );
                 memcpy(eee->relay_mac, pi.mac, N2N_MAC_SIZE);
                 eee->relay_sock = pi.sockets[0];
                 eee->relay_valid = 1;
                 eee->relay_last_reg = 0; /* register to R on next tick */
-                traceEvent(TRACE_NORMAL, "Rx PEER_INFO RELAY relay=%s at %s",
-                           macaddr_str(mac_buf1, pi.mac),
-                           sock_to_cstr(sockbuf1, &pi.sockets[0]));
+                if (relay_changed)
+                    traceEvent(TRACE_NORMAL, "Rx PEER_INFO RELAY relay=%s at %s",
+                               macaddr_str(mac_buf1, pi.mac),
+                               sock_to_cstr(sockbuf1, &pi.sockets[0]));
             }
 
             if (pi.assigned_ip) {

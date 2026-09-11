@@ -2514,26 +2514,25 @@ static int is_relay_capable( const struct peer_info * peer )
 /* Pick the community's relay R among registered edges. Excludes a given MAC
  * (e.g. the registering party) so R never relays for itself. Among relay-capable
  * peers, priority follows the edges' declared willingness: eager (2) first,
- * default (1) next, unwilling (0) only as last resort. Newest peer first (edges
- * list is latest-first). Returns NULL if none eligible. */
+ * default (1/unknown) next; unwilling (0) is never picked, even if it is the
+ * only eligible peer (SN falls back to plain SN relay in that case). Newest peer
+ * first (edges list is latest-first). Returns NULL if none eligible. */
 static struct peer_info * find_community_relay( n2n_sn_t *sss,
                                                 const n2n_community_t community,
                                                 const n2n_mac_t exclude_mac )
 {
     struct peer_info * scan;
     struct peer_info * best_default = NULL; /* willing==1 */
-    struct peer_info * best_unwilling = NULL; /* willing==0 */
     for ( scan = sss->edges; scan; scan = scan->next )
     {
         if ( memcmp(scan->mac_addr, exclude_mac, N2N_MAC_SIZE) == 0 ) continue;
         if ( memcmp(scan->community_name, community, sizeof(n2n_community_t)) != 0 ) continue;
         if ( !is_relay_capable(scan) ) continue;
         if ( scan->relay_willing == 2 ) return scan;       /* eager: prefer immediately */
-        else if ( scan->relay_willing == 1 ) { if (!best_default) best_default = scan; }
-        else                                              { if (!best_unwilling) best_unwilling = scan; }
+        if ( scan->relay_willing == 0 ) continue;          /* unwilling: never pick, even if alone */
+        if ( !best_default ) best_default = scan;          /* willing==1 / unknown */
     }
-    if ( best_default ) return best_default;
-    return best_unwilling;
+    return best_default;
 }
 
 /* Send one PEER_INFO telling <dest> that <relay> is the community relay R.
