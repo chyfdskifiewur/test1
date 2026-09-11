@@ -2075,10 +2075,8 @@ static void check_relay( n2n_edge_t * eee, time_t now )
         eee->relay_proven = 0;
         eee->relay_giveup  = 1;
         eee->relay_probe_next = now + 35;
-        {
-            traceEvent( TRACE_NORMAL, "relay: relay silent %us - falling back to SN",
-                        RELAY_PROVEN_SECS );
-        }
+        traceEvent( TRACE_NORMAL, "relay: relay silent %us - falling back to SN",
+                    RELAY_PROVEN_SECS );
     }
     /* periodic retry: give R another chance after it was marked dead. */
     else if ( eee->relay_giveup && now >= eee->relay_probe_next )
