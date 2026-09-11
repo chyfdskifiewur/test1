@@ -230,36 +230,32 @@ typedef char macstr_t[N2N_MACSTR_SIZE];
  * address-restricted without a never-contacted third IP, so it reports
  * as addr-restr. */
 #define N2N_NAT_UNKNOWN        0
-#define N2N_NAT_CONE           1
 #define N2N_NAT_SYMMETRIC      2
 #define N2N_NAT_FULL_CONE      3  /* reserved: needs a never-contacted 3rd IP */
 #define N2N_NAT_RESTRICTED     4  /* addr-restr: helper bounce got through (incl. full cone) */
 #define N2N_NAT_PORT_RESTRICT  5  /* no bounce despite requests */
 
 /* Shared display name for a N2N_NAT_* value ("unknown" when not measured). */
-#define N2N_NAT_NAME(t) ( (t) == N2N_NAT_CONE ? "cone" : \
-                          (t) == N2N_NAT_FULL_CONE ? "full-cone" : \
+#define N2N_NAT_NAME(t) ( (t) == N2N_NAT_FULL_CONE ? "full-cone" : \
                           (t) == N2N_NAT_RESTRICTED ? "addr-restr" : \
                           (t) == N2N_NAT_PORT_RESTRICT ? "port-restr" : \
                           (t) == N2N_NAT_SYMMETRIC ? "symmetric" : "unknown" )
 
 /* NAT type <-> aflags bits: REGISTER_SUPER carries the edge's own type,
  * PEER_INFO carries a peer's type to edges for mgmt display. */
-#define N2N_NAT_AFLAGS(t) ( (t) == N2N_NAT_CONE ? N2N_AFLAGS_NAT_CONE : \
-                            (t) == N2N_NAT_FULL_CONE ? N2N_AFLAGS_NAT_FULL_CONE : \
+#define N2N_NAT_AFLAGS(t) ( (t) == N2N_NAT_FULL_CONE ? N2N_AFLAGS_NAT_FULL_CONE : \
                             (t) == N2N_NAT_RESTRICTED ? N2N_AFLAGS_NAT_RESTRICTED : \
                             (t) == N2N_NAT_PORT_RESTRICT ? N2N_AFLAGS_NAT_PORT_RESTRICT : \
                             (t) == N2N_NAT_SYMMETRIC ? N2N_AFLAGS_NAT_SYMMETRIC : 0 )
 #define N2N_NAT_FROM_AFLAGS(a) ( ((a) & N2N_AFLAGS_NAT_RESTRICTED) ? N2N_NAT_RESTRICTED : \
                                  ((a) & N2N_AFLAGS_NAT_PORT_RESTRICT) ? N2N_NAT_PORT_RESTRICT : \
                                  ((a) & N2N_AFLAGS_NAT_FULL_CONE) ? N2N_NAT_FULL_CONE : \
-                                 ((a) & N2N_AFLAGS_NAT_SYMMETRIC) ? N2N_NAT_SYMMETRIC : \
-                                 ((a) & N2N_AFLAGS_NAT_CONE) ? N2N_NAT_CONE : N2N_NAT_UNKNOWN )
+                                 ((a) & N2N_AFLAGS_NAT_SYMMETRIC) ? N2N_NAT_SYMMETRIC : N2N_NAT_UNKNOWN )
 
 /* NAT types eligible to act as the community relay R (mini-SN).
- * Phase 1: NAT1 only. Note nat_classify() never emits N2N_NAT_CONE; its NAT1
- * result is N2N_NAT_FULL_CONE. NAT2 (addr-restr) is reserved: extend this
- * single macro when implemented, else the edge falls back to SN relay. */
+ * Phase 1: NAT1 only (N2N_NAT_FULL_CONE). NAT2 (addr-restr) is reserved:
+ * extend this single macro when implemented, else the edge falls back to
+ * SN relay. */
 #define N2N_NAT_RELAY_CAPABLE(t) ( (t) == N2N_NAT_FULL_CONE )
 
 struct peer_info {
@@ -544,6 +540,14 @@ struct n2n_edge
      * (NAT1 + public address) self-enables this. NAT2 R is left for the
      * "else -> back to SN" fallback and is not implemented. */
     uint8_t             relay_mode;
+
+    /* R-RELAY server member table (mini-SN). Unlike known_peers/pending_peers
+     * (the P2P tables this edge punches on), R keeps a dedicated list of peers
+     * that registered to it for forwarding; these are reachable directly
+     * (NAT1) so their socket comes from the actual REGISTER transport source.
+     * This mirrors how the SN maintains its edge list, and is independent of
+     * P2P cleanup so the relay path survives peer-table churn. */
+    struct peer_info *  relay_peers;
 
     struct peer_info *  known_peers;
     struct peer_info *  pending_peers;

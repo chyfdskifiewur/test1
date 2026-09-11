@@ -1419,7 +1419,6 @@ static void send_register_super( n2n_edge_t * eee,
         case N2N_NAT_FULL_CONE:     reg.aflags |= N2N_AFLAGS_NAT_FULL_CONE; break;
         case N2N_NAT_RESTRICTED:    reg.aflags |= N2N_AFLAGS_NAT_RESTRICTED; break;
         case N2N_NAT_PORT_RESTRICT: reg.aflags |= N2N_AFLAGS_NAT_PORT_RESTRICT; break;
-        case N2N_NAT_CONE:          reg.aflags |= N2N_AFLAGS_NAT_CONE; break;
         case N2N_NAT_SYMMETRIC:     reg.aflags |= N2N_AFLAGS_NAT_SYMMETRIC; break;
         }
     }
@@ -1427,8 +1426,7 @@ static void send_register_super( n2n_edge_t * eee,
     /* Ask for a NAT bounce test on every registration while the type is not
      * final yet; the sn replies from its helper socket before ACKing. */
     if ( !eee->use_ws &&
-         ( eee->nat_type == N2N_NAT_UNKNOWN ||
-           eee->nat_type == N2N_NAT_CONE ) )
+         eee->nat_type == N2N_NAT_UNKNOWN )
         reg.aflags |= N2N_AFLAGS_NAT_BOUNCE;
 
     /* ask_backup lookup hints: sn2 matches the brother and returns its
@@ -1991,6 +1989,30 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
  * and let its own copy age out (R-RELAY design: "direct success -> leave R"). */
 static void check_relay( n2n_edge_t * eee, time_t now )
 {
+    /* R-RELAY server: age out stale members from the dedicated table, mirroring
+     * how the SN expires its edge list. AB refresh their REGISTER every 3s, so
+     * a member silent for 60s is assumed gone. Independent of the client side. */
+    if ( eee->relay_mode )
+    {
+        PEERS_LOCK(eee);
+        struct peer_info **pp = &eee->relay_peers;
+        while ( *pp )
+        {
+            struct peer_info *rp = *pp;
+            if ( (now - rp->last_seen) > 60 )
+            {
+                macstr_t mb;
+                *pp = rp->next;
+                traceEvent( TRACE_INFO, "R-RELAY: drop stale member %s",
+                            macaddr_str( mb, rp->mac_addr ) );
+                free( rp );
+            }
+            else
+                pp = &rp->next;
+        }
+        PEERS_UNLOCK(eee);
+    }
+
     if ( !eee->relay_valid ) return;
 
     {
@@ -2013,8 +2035,13 @@ static void check_relay( n2n_edge_t * eee, time_t now )
     /* Keep R's copy of our socket alive (also registers us to R initially). */
     if ( eee->relay_sock.family != 0 && (now - eee->relay_last_reg) >= 3 )
     {
+        n2n_sock_str_t rsbuf;
         eee->relay_last_reg = now;
         send_register( eee, &eee->relay_sock );
+        traceEvent( TRACE_NORMAL, "R-relay: reg to %s proven=%u valid=%u",
+                    sock_to_cstr( rsbuf, &eee->relay_sock ),
+                    (unsigned)(eee->relay_proven != 0),
+                    (unsigned)eee->relay_valid );
     }
 }
 
@@ -3063,17 +3090,16 @@ static int send_PACKET( n2n_edge_t * eee,
             ++(eee->tx_sup); eee->super_tx_bytes += pktlen;
         }
     } else {
-        /* No direct P2P: when a community relay R is assigned, dual-send —
-         * via R, keeping the supernode copy as fallback until a frame
-         * actually comes back through R (relay_proven != 0); once proven,
-         * relay-only (supernode forwarding off). R failure also falls back. */
+        /* No direct P2P: when a community relay R is assigned and the target
+         * is not broadcastable, route via R only (no supernode copy). Only if
+         * the R send fails do we fall back to the supernode. */
         int via_relay = (eee->relay_valid && !is_multi_broadcast(dstMac));
         ssize_t r = -1;
         if (via_relay)
             r = sendto_sock( sock_for_dest(eee, &eee->relay_sock),
                              pktbuf, pktlen, &eee->relay_sock );
-        if (eee->relay_proven == 0 || r <= 0) {
-            /* Not proven yet, or R failed: keep the supernode copy. */
+        if (r <= 0) {
+            /* R absent or send failed: fall back to the supernode. */
             if (edge_send_to_sn(eee, pktbuf, pktlen) <= 0) {
                 /* Consecutive failures trigger supernode re-registration */
                 if (++eee->sn_relay_fails >= 3)
@@ -3432,11 +3458,23 @@ static int handle_PACKET( n2n_edge_t * eee,
          memcmp(pkt->dstMac, eee->device.mac_addr, N2N_MAC_SIZE) != 0 )
     {
         struct peer_info *dst = NULL;
+        n2n_sock_t *dst_sock = NULL;
         PEERS_LOCK(eee);
-        dst = find_peer_by_mac(eee->known_peers, pkt->dstMac);
-        if (!dst) dst = find_peer_by_mac(eee->pending_peers, pkt->dstMac);
+        /* Prefer the dedicated member table (mini-SN). Fall back to the P2P
+         * tables only if the registrant has not arrived via REGISTER yet
+         * (e.g. the first frame before registration completes). */
+        dst = find_peer_by_mac(eee->relay_peers, pkt->dstMac);
+        if (dst && dst->sock.family != 0)
+            dst_sock = &dst->sock;
+        else if (dst && dst->sock6.family != 0)
+            dst_sock = &dst->sock6;
+        else {
+            dst = find_peer_by_mac(eee->known_peers, pkt->dstMac);
+            if (!dst) dst = find_peer_by_mac(eee->pending_peers, pkt->dstMac);
+            if (dst && dst->sock.family != 0) dst_sock = &dst->sock;
+        }
         PEERS_UNLOCK(eee);
-        if (dst && dst->sock.family != 0) {
+        if (dst_sock) {
             n2n_common_t cmn2;
             n2n_PACKET_t pkt2;
             uint8_t fwd[N2N_PKT_BUF_SIZE];
@@ -3455,7 +3493,7 @@ static int handle_PACKET( n2n_edge_t * eee,
             }
             traceEvent(TRACE_DEBUG, "R-RELAY: forward %s -> %s",
                        macaddr_str(mbA, pkt->srcMac), macaddr_str(mbB, pkt->dstMac));
-            sendto_sock(sock_for_dest(eee, &dst->sock), fwd, idx, &dst->sock);
+            sendto_sock(sock_for_dest(eee, dst_sock), fwd, idx, dst_sock);
         }
         return retval;
     }
@@ -4553,6 +4591,29 @@ process_n2n_packet:
                  0 == memcmp(reg.dstMac, "\x00\x00\x00\x00\x00\x00", 6) )
             {
                 PEERS_LOCK(eee);
+                /* R-RELAY (mini-SN): when this edge acts as relay R, remember
+                 * the registrant in a dedicated member table for forwarding,
+                 * independent of the P2P peer tables. The registrant reaches R
+                 * directly (NAT1), so use the REGISTER transport source. */
+                if (eee->relay_mode && sender.family != 0) {
+                    struct peer_info *rp = find_peer_by_mac(eee->relay_peers, reg.srcMac);
+                    if (!rp) {
+                        rp = calloc(1, sizeof(struct peer_info));
+                        if (rp) {
+                            memcpy(rp->mac_addr, reg.srcMac, N2N_MAC_SIZE);
+                            rp->next = eee->relay_peers;
+                            eee->relay_peers = rp;
+                        }
+                    }
+                    if (rp) {
+                        if (sender.family == AF_INET) rp->sock = sender;
+                        else rp->sock6 = sender;
+                        rp->last_seen = n2n_now();
+                        traceEvent(TRACE_INFO, "R-RELAY: member %s at %s",
+                                   macaddr_str(mac_buf1, reg.srcMac),
+                                   sock_to_cstr(sockbuf1, &sender));
+                    }
+                }
                 struct peer_info *scan = find_peer_by_mac(eee->known_peers, reg.srcMac);
                 if (NULL == scan) {
                     if ( reg.sock.family != 0 && reg.sock.port != 0 &&
