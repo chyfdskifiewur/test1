@@ -2076,9 +2076,7 @@ static void check_relay( n2n_edge_t * eee, time_t now )
         eee->relay_giveup  = 1;
         eee->relay_probe_next = now + 35;
         {
-            char vip[16];
-            traceEvent( TRACE_NORMAL, "relay: no frame via relay %s for %us - falling back to SN",
-                        relay_virt_ip_str( eee, vip, sizeof vip ),
+            traceEvent( TRACE_NORMAL, "relay: relay silent %us - falling back to SN",
                         RELAY_PROVEN_SECS );
         }
     }
@@ -3608,10 +3606,11 @@ static int handle_PACKET( n2n_edge_t * eee,
                         sock_equal( &eee->relay_sock, tx_sender ) == 0 ) ? 1 : 0;
     if (from_relay && eee->relay_proven == 0)
     {
-        char vip[16];
+        char vip[16]; n2n_sock_str_t relbuf;
+        const char * where = relay_virt_ip_str( eee, vip, sizeof vip );
+        if ( vip[0] == '-' ) where = sock_to_cstr( relbuf, &eee->relay_sock );
         eee->relay_proven = now;
-        traceEvent( TRACE_NORMAL, "relay: relay path proven via %s",
-                    relay_virt_ip_str( eee, vip, sizeof vip ) );
+        traceEvent( TRACE_NORMAL, "relay: relay path proven via %s", where );
     }
     else if (from_relay)
         eee->relay_proven = now;
@@ -4106,6 +4105,13 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
             peer = peer->next;
             continue;
         }
+        /* Members being relayed belong to the relay: section below; show them
+         * there instead of duplicating them in P2P_with. */
+        if (eee->relay_peers != NULL &&
+            find_peer_by_mac(eee->relay_peers, peer->mac_addr)) {
+            peer = peer->next;
+            continue;
+        }
         const char *version = (peer->version[0] != '\0') ? peer->version : "unknown";
         const char *os_name = (peer->os_name[0] != '\0') ? peer->os_name : "unknown";
 
@@ -4154,6 +4160,36 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
         sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
                (struct sockaddr*) &sender_sock, i);
         peer = peer->next;
+    }
+
+    /* Send relay info: shown on the machine acting as a community relay (R);
+     * list the members it currently relays for. */
+    if (eee->relay_peers != NULL) {
+        msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE, "Relay:\n");
+        sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
+               (struct sockaddr*) &sender_sock, i);
+
+        struct peer_info *rp = eee->relay_peers;
+        int rid = 1;
+        while (rp) {
+            const char *rver = (rp->version[0] != '\0') ? rp->version : "unknown";
+            const char *ros  = (rp->os_name[0] != '\0') ? rp->os_name : "unknown";
+            char rvip[16] = "-";
+            if (rp->assigned_ip != 0) {
+                struct in_addr ra;
+                ra.s_addr = htonl(rp->assigned_ip);
+                inet_ntop(AF_INET, &ra, rvip, sizeof(rvip));
+            }
+            n2n_sock_str_t rsbuf;
+            msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,
+                               " %2u  %-17s  %-15s  %-48s  %-7s  %-7s  %s\n",
+                               rid++, macaddr_str( mac, rp->mac_addr ), rvip,
+                               sock_to_cstr( rsbuf, &rp->sock ), rver, ros,
+                               N2N_NAT_NAME(rp->nat_type));
+            sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
+                   (struct sockaddr*) &sender_sock, i);
+            rp = rp->next;
+        }
     }
 
     /* Send supernode info */
@@ -4715,6 +4751,16 @@ process_n2n_packet:
                         if (sender.family == AF_INET) rp->sock = sender;
                         else rp->sock6 = sender;
                         rp->last_seen = n2n_now();
+                        /* Enrich the member entry with the info R already has
+                         * about this MAC (from SN PEER_INFO) so the management
+                         * page can show its virtual IP / version / OS / NAT. */
+                        struct peer_info *kn = find_peer_by_mac(eee->known_peers, reg.srcMac);
+                        if (kn) {
+                            rp->assigned_ip = kn->assigned_ip;
+                            memcpy(rp->version, kn->version, sizeof rp->version);
+                            memcpy(rp->os_name,  kn->os_name,  sizeof rp->os_name);
+                            rp->nat_type    = kn->nat_type;
+                        }
                         traceEvent(TRACE_INFO, "relay: member %s at %s",
                                    macaddr_str(mac_buf1, reg.srcMac),
                                    sock_to_cstr(sockbuf1, &sender));
