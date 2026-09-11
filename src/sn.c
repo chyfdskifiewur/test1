@@ -2499,11 +2499,12 @@ static void push_nat_to_community( n2n_sn_t *sss,
  * ------------------------------------------------------------------------ */
 
 /* A peer is relay-capable only if its extern addr is a public IPv4 and its
- * NAT type is cone (NAT1). Private addrs would make A/B unreachable. */
+ * NAT type is relay-eligible (N2N_NAT_RELAY_CAPABLE). Private addrs would
+ * make A/B unreachable. */
 static int is_relay_capable( const struct peer_info * peer )
 {
     if (!peer) return 0;
-    if (peer->nat_type != N2N_NAT_CONE) return 0;
+    if (!N2N_NAT_RELAY_CAPABLE(peer->nat_type)) return 0;
     if (peer->sock.family != AF_INET) return 0;
     return !is_private_ipv4(peer->sock.addr.v4);
 }

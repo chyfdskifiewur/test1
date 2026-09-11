@@ -256,6 +256,12 @@ typedef char macstr_t[N2N_MACSTR_SIZE];
                                  ((a) & N2N_AFLAGS_NAT_SYMMETRIC) ? N2N_NAT_SYMMETRIC : \
                                  ((a) & N2N_AFLAGS_NAT_CONE) ? N2N_NAT_CONE : N2N_NAT_UNKNOWN )
 
+/* NAT types eligible to act as the community relay R (mini-SN).
+ * Phase 1: NAT1 only. Note nat_classify() never emits N2N_NAT_CONE; its NAT1
+ * result is N2N_NAT_FULL_CONE. NAT2 (addr-restr) is reserved: extend this
+ * single macro when implemented, else the edge falls back to SN relay. */
+#define N2N_NAT_RELAY_CAPABLE(t) ( (t) == N2N_NAT_FULL_CONE )
+
 struct peer_info {
     struct peer_info *  next;
     n2n_community_t     community_name;

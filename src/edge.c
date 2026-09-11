@@ -2625,8 +2625,9 @@ static void nat_classify( n2n_edge_t * eee )
     new = N2N_NAT_NAME( new_type );
     eee->nat_type = new_type;
 
-    /* R-RELAY: a good peer (NAT1 / cone + public address) self-enables acting
-     * as relay R. Named "else -> back to SN" for NAT2 is intentionally absent. */
+    /* R-RELAY: a good peer (NAT1 / public address) self-enables acting as
+     * relay R when its NAT type is relay-eligible (N2N_NAT_RELAY_CAPABLE).
+     * Other NAT types intentionally keep the SN-relay fallback. */
     {
         uint32_t ip = (eee->my_public_sock.family == AF_INET)
                     ? ((uint32_t)eee->my_public_sock.addr.v4[0] << 24) |
@@ -2635,7 +2636,7 @@ static void nat_classify( n2n_edge_t * eee )
                        (uint32_t)eee->my_public_sock.addr.v4[3] : 0;
         int priv = ((ip >> 24) == 10) || ((ip & 0xFFF00000) == 0xAC100000) ||
                    ((ip >> 16) == (192 << 8 | 168)) || (ip == 0);
-        eee->relay_mode = (eee->nat_type == N2N_NAT_CONE && !priv) ? 1 : 0;
+        eee->relay_mode = (N2N_NAT_RELAY_CAPABLE(eee->nat_type) && !priv) ? 1 : 0;
     }
 
     traceEvent( TRACE_NORMAL, "NAT type: %s -> %s", old, new );
