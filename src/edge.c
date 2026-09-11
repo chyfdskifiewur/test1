@@ -1987,6 +1987,12 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
  * socket fresh at R by re-registering to it periodically. As soon as any direct
  * P2P link is established the relay is no longer needed, so we stop servicing R
  * and let its own copy age out (R-RELAY design: "direct success -> leave R"). */
+
+/* How long a proven R path stays "trusted" without further traffic through R.
+ * If no frame arrives via R for this long, R is assumed dead and the edge
+ * falls back to the supernode (and periodically retries R). */
+#define RELAY_PROVEN_SECS   10
+
 static void check_relay( n2n_edge_t * eee, time_t now )
 {
     /* R-RELAY server: age out stale members from the dedicated table, mirroring
@@ -2030,6 +2036,29 @@ static void check_relay( n2n_edge_t * eee, time_t now )
             eee->relay_proven = 0;
             return;
         }
+    }
+
+    /* R failure detection: a proven R is only trusted while traffic keeps
+     * flowing through it. If nothing has come back via R for RELAY_PROVEN_SECS,
+     * R has likely died -> fall back to the supernode and stop dual-sending to
+     * it; schedule a periodic retry so we resume R once it returns. */
+    if ( eee->relay_proven > 0 &&
+         (now - eee->relay_proven) > RELAY_PROVEN_SECS )
+    {
+        eee->relay_proven = 0;
+        eee->relay_giveup  = 1;
+        eee->relay_probe_next = now + 35;
+        traceEvent( TRACE_NORMAL, "R-relay: no frame via R for %us - falling back to SN",
+                    RELAY_PROVEN_SECS );
+    }
+    /* periodic retry: give R another chance after it was marked dead. */
+    else if ( eee->relay_giveup && now >= eee->relay_probe_next )
+    {
+        eee->relay_giveup = 0;
+        eee->relay_probe_next = now + 35;
+        eee->relay_probe_sent = 0;
+        eee->relay_probe_start = 0;
+        traceEvent( TRACE_NORMAL, "R-relay: retrying R" );
     }
 
     /* Keep R's copy of our socket alive (also registers us to R initially). */
@@ -3134,26 +3163,21 @@ static int send_PACKET( n2n_edge_t * eee,
             ++(eee->tx_sup); eee->super_tx_bytes += pktlen;
         }
     } else {
-        /* No direct P2P to this MAC. If a community relay R is assigned and
-         * the target is not broadcastable, we route via R, but first prove R
-         * actually reaches the peer (RELAY_PROBE echo through R) so we can
-         * safely drop the supernode copy without losing the flow:
-         *
-         *   - 3s gate: wait for AB to finish registering to R.
-         *   - dual-send R+SN while the R path is unproven (no data loss).
-         *   - every 35s send a flagged PROBE via R (up to 3 tries).
-         *   - matching echo seen through R -> relay_proven -> SN copy off.
-         *   - 3 probes with no echo -> give up, back to SN only.
-         * R send failure at any point also falls back to SN. */
+        /* No direct P2P to this MAC. If a community relay R is assigned and the
+         * target is not broadcastable, route via R. While the R path is unproven
+         * (or recently silent) we dual-send R+SN so no data is lost; once a frame
+         * actually comes back through R (relay_proven, 10s window) we use R only.
+         * A dead R (no frame via R for RELAY_PROVEN_SECS) is handled in
+         * check_relay, which flags giveup and falls back to SN. R send failure
+         * here also falls back to SN. */
         int via_relay = (eee->relay_valid && !is_multi_broadcast(dstMac));
         if (via_relay && !eee->relay_giveup)
         {
             time_t rnow = n2n_now();
-            if (eee->relay_probe_start == 0)
-                eee->relay_probe_start = rnow;
-
-            /* proven: R round-trip confirmed -> use R only, no SN copy. */
-            int proven = (eee->relay_proven != 0);
+            /* proven only while actively hearing from R; a dead R cannot
+             * permanently strand the flow thanks to the 10s window. */
+            int proven = ( eee->relay_proven != 0 &&
+                          (rnow - eee->relay_proven) <= RELAY_PROVEN_SECS );
             if (proven)
             {
                 sendto_sock( sock_for_dest(eee, &eee->relay_sock),
@@ -3161,7 +3185,8 @@ static int send_PACKET( n2n_edge_t * eee,
             }
             else
             {
-                /* unproven path: dual-send R + SN (no loss), probe periodically. */
+                /* unproven: dual-send R + SN so nothing is lost while R is
+                 * still being verified. */
                 ssize_t r = sendto_sock( sock_for_dest(eee, &eee->relay_sock),
                                          pktbuf, pktlen, &eee->relay_sock );
                 if ( edge_send_to_sn(eee, pktbuf, pktlen) <= 0 )
@@ -3175,20 +3200,6 @@ static int send_PACKET( n2n_edge_t * eee,
                 }
                 ++(eee->tx_sup); eee->super_tx_bytes += pktlen;
 
-                /* start probing after the 3s registration gate */
-                if ( (rnow - eee->relay_probe_start) >= 3 )
-                {
-                    if ( eee->relay_probe_next == 0 )
-                        eee->relay_probe_next = rnow;
-                    if ( rnow >= eee->relay_probe_next )
-                    {
-                        send_relay_probe( eee, dstMac );
-                        ++eee->relay_probe_sent;
-                        eee->relay_probe_next = rnow + 35;
-                        if ( eee->relay_probe_sent >= 3 && !eee->relay_proven )
-                            eee->relay_giveup = 1;
-                    }
-                }
                 if ( r <= 0 )
                 {
                     /* R send failed now: force the SN copy only going forward. */
