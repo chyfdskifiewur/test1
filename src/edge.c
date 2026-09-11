@@ -2001,7 +2001,23 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
 /* How long a proven relay path stays "trusted" without further traffic through
      * it. If no frame arrives via the relay for this long, the relay is assumed
      * dead and the edge falls back to the supernode (and periodically retries). */
-#define RELAY_PROVEN_SECS   3
+#define RELAY_PROVEN_SECS   5
+
+/* Virtual IP of the current community relay (resolved from the relay peer's
+ * assigned_ip, same source the management page uses), or "-" if unknown yet. */
+static const char * relay_virt_ip_str( n2n_edge_t * eee, char * buf, size_t n )
+{
+    struct peer_info * p = find_peer_by_mac( eee->known_peers, eee->relay_mac );
+    if ( !p ) p = find_peer_by_mac( eee->pending_peers, eee->relay_mac );
+    if ( p && p->assigned_ip != 0 ) {
+        struct in_addr a;
+        a.s_addr = htonl( p->assigned_ip );
+        inet_ntop( AF_INET, &a, buf, n );
+        return buf;
+    }
+    snprintf( buf, n, "-" );
+    return buf;
+}
 
 static void check_relay( n2n_edge_t * eee, time_t now )
 {
@@ -2059,15 +2075,23 @@ static void check_relay( n2n_edge_t * eee, time_t now )
         eee->relay_proven = 0;
         eee->relay_giveup  = 1;
         eee->relay_probe_next = now + 35;
-        traceEvent( TRACE_NORMAL, "relay: no frame via relay for %us - falling back to SN",
-                    RELAY_PROVEN_SECS );
+        {
+            char vip[16];
+            traceEvent( TRACE_NORMAL, "relay: no frame via relay %s for %us - falling back to SN",
+                        relay_virt_ip_str( eee, vip, sizeof vip ),
+                        RELAY_PROVEN_SECS );
+        }
     }
     /* periodic retry: give R another chance after it was marked dead. */
     else if ( eee->relay_giveup && now >= eee->relay_probe_next )
     {
         eee->relay_giveup = 0;
         eee->relay_probe_next = now + 35;
-        traceEvent( TRACE_NORMAL, "relay: retrying relay" );
+        {
+            char vip[16];
+            traceEvent( TRACE_NORMAL, "relay: retrying relay %s",
+                        relay_virt_ip_str( eee, vip, sizeof vip ) );
+        }
     }
 
     /* Keep R's copy of our socket alive (also registers us to R initially).
@@ -3584,8 +3608,10 @@ static int handle_PACKET( n2n_edge_t * eee,
                         sock_equal( &eee->relay_sock, tx_sender ) == 0 ) ? 1 : 0;
     if (from_relay && eee->relay_proven == 0)
     {
+        char vip[16];
         eee->relay_proven = now;
-        traceEvent( TRACE_NORMAL, "relay: relay path proven" );
+        traceEvent( TRACE_NORMAL, "relay: relay path proven via %s",
+                    relay_virt_ip_str( eee, vip, sizeof vip ) );
     }
     else if (from_relay)
         eee->relay_proven = now;
