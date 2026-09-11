@@ -549,6 +549,15 @@ struct n2n_edge
      * P2P cleanup so the relay path survives peer-table churn. */
     struct peer_info *  relay_peers;
 
+    /* R-relay probe (client side): before switching a relayed flow off the
+     * supernode, A sends flagged PROBE PACKETs via R and only trusts R once a
+     * matching echo comes back from the peer THROUGH R (from_relay). */
+    uint32_t            relay_probe_n;           /* random id of the current probe */
+    time_t              relay_probe_start;      /* when R probing began (3s delay gate) */
+    time_t              relay_probe_next;       /* when to send the next probe */
+    uint8_t             relay_probe_sent;       /* how many probes have been sent (cap 3) */
+    uint8_t             relay_giveup;           /* 1=3 probes no echo: drop R, stay on SN */
+
     struct peer_info *  known_peers;
     struct peer_info *  pending_peers;
 #ifdef _WIN32

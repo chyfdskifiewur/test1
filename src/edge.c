@@ -3002,6 +3002,50 @@ static const struct option long_options[] = {
 
 /* ***************************************************** */
 
+/* Send a flagged RELAY probe to <dstMac> via R. The probe carries a random
+ * 4-byte id in its (plain) payload; the peer reflects it verbatim through R,
+ * and a matching echo seen from relay_sock proves the R path end-to-end. */
+static void send_relay_probe( n2n_edge_t * eee, const n2n_mac_t dstMac )
+{
+    if ( !eee->relay_valid || eee->relay_sock.family == 0 )
+        return;
+
+    uint8_t pktbuf[N2N_PKT_BUF_SIZE];
+    size_t idx = 0;
+    n2n_common_t cmn;
+    n2n_PACKET_t pkt;
+    uint32_t n;
+
+    n = (uint32_t)rand();
+    eee->relay_probe_n = n;   /* remember what we are waiting to see echoed */
+
+    memset( &cmn, 0, sizeof(cmn) );
+    cmn.ttl = N2N_DEFAULT_TTL;
+    cmn.pc = n2n_packet;
+    cmn.flags = N2N_FLAGS_PROBE;
+    memcpy( cmn.community, eee->community_name, N2N_COMMUNITY_SIZE );
+
+    memset( &pkt, 0, sizeof(pkt) );
+    memcpy( pkt.srcMac, eee->device.mac_addr, N2N_MAC_SIZE );
+    memcpy( pkt.dstMac, dstMac, N2N_MAC_SIZE );
+    pkt.sock.family = 0;
+    pkt.transform = eee->transop[eee->tx_transop_idx].transform_id;
+
+    encode_PACKET( pktbuf, &idx, &cmn, &pkt );
+    memcpy( pktbuf + idx, &n, sizeof(n) );
+    idx += sizeof(n);
+
+    {
+        macstr_t mb;
+        traceEvent( TRACE_INFO, "R-relay: PROBE %08x to %s via R",
+                    (unsigned)n, macaddr_str( mb, dstMac ) );
+    }
+
+    sendto_sock( sock_for_dest(eee, &eee->relay_sock), pktbuf, idx, &eee->relay_sock );
+}
+
+/* ***************************************************** */
+
 /** Send an ecapsulated ethernet PACKET to a destination edge or broadcast MAC
  *  address. */
 static int send_PACKET( n2n_edge_t * eee,
@@ -3090,16 +3134,71 @@ static int send_PACKET( n2n_edge_t * eee,
             ++(eee->tx_sup); eee->super_tx_bytes += pktlen;
         }
     } else {
-        /* No direct P2P: when a community relay R is assigned and the target
-         * is not broadcastable, route via R only (no supernode copy). Only if
-         * the R send fails do we fall back to the supernode. */
+        /* No direct P2P to this MAC. If a community relay R is assigned and
+         * the target is not broadcastable, we route via R, but first prove R
+         * actually reaches the peer (RELAY_PROBE echo through R) so we can
+         * safely drop the supernode copy without losing the flow:
+         *
+         *   - 3s gate: wait for AB to finish registering to R.
+         *   - dual-send R+SN while the R path is unproven (no data loss).
+         *   - every 35s send a flagged PROBE via R (up to 3 tries).
+         *   - matching echo seen through R -> relay_proven -> SN copy off.
+         *   - 3 probes with no echo -> give up, back to SN only.
+         * R send failure at any point also falls back to SN. */
         int via_relay = (eee->relay_valid && !is_multi_broadcast(dstMac));
-        ssize_t r = -1;
-        if (via_relay)
-            r = sendto_sock( sock_for_dest(eee, &eee->relay_sock),
+        if (via_relay && !eee->relay_giveup)
+        {
+            time_t rnow = n2n_now();
+            if (eee->relay_probe_start == 0)
+                eee->relay_probe_start = rnow;
+
+            /* proven: R round-trip confirmed -> use R only, no SN copy. */
+            int proven = (eee->relay_proven != 0);
+            if (proven)
+            {
+                sendto_sock( sock_for_dest(eee, &eee->relay_sock),
                              pktbuf, pktlen, &eee->relay_sock );
-        if (r <= 0) {
-            /* R absent or send failed: fall back to the supernode. */
+            }
+            else
+            {
+                /* unproven path: dual-send R + SN (no loss), probe periodically. */
+                ssize_t r = sendto_sock( sock_for_dest(eee, &eee->relay_sock),
+                                         pktbuf, pktlen, &eee->relay_sock );
+                if ( edge_send_to_sn(eee, pktbuf, pktlen) <= 0 )
+                {
+                    if (++eee->sn_relay_fails >= 3)
+                        eee->last_register_req = 0;
+                }
+                else
+                {
+                    eee->sn_relay_fails = 0;
+                }
+                ++(eee->tx_sup); eee->super_tx_bytes += pktlen;
+
+                /* start probing after the 3s registration gate */
+                if ( (rnow - eee->relay_probe_start) >= 3 )
+                {
+                    if ( eee->relay_probe_next == 0 )
+                        eee->relay_probe_next = rnow;
+                    if ( rnow >= eee->relay_probe_next )
+                    {
+                        send_relay_probe( eee, dstMac );
+                        ++eee->relay_probe_sent;
+                        eee->relay_probe_next = rnow + 35;
+                        if ( eee->relay_probe_sent >= 3 && !eee->relay_proven )
+                            eee->relay_giveup = 1;
+                    }
+                }
+                if ( r <= 0 )
+                {
+                    /* R send failed now: force the SN copy only going forward. */
+                    eee->relay_giveup = 1;
+                }
+            }
+        }
+        else
+        {
+            /* R absent / gave up / broadcast: plain supernode relay. */
             if (edge_send_to_sn(eee, pktbuf, pktlen) <= 0) {
                 /* Consecutive failures trigger supernode re-registration */
                 if (++eee->sn_relay_fails >= 3)
@@ -3483,7 +3582,7 @@ static int handle_PACKET( n2n_edge_t * eee,
             memset(&cmn2, 0, sizeof(cmn2));
             cmn2.ttl   = N2N_DEFAULT_TTL;
             cmn2.pc    = n2n_packet;
-            cmn2.flags = 0;            /* not "from supernode": dst sees a peer */
+            cmn2.flags = cmn->flags & N2N_FLAGS_PROBE; /* carry relay-probe marker through */
             memcpy(cmn2.community, cmn->community, sizeof(n2n_community_t));
             memcpy(&pkt2, pkt, sizeof(pkt2));
             encode_PACKET(fwd, &idx, &cmn2, &pkt2);
@@ -3509,6 +3608,65 @@ static int handle_PACKET( n2n_edge_t * eee,
                         sock_equal( &eee->relay_sock, tx_sender ) == 0 ) ? 1 : 0;
     if (from_relay)
         eee->relay_proven = now;
+
+    /* R-RELAY probe: a PACKET flagged N2N_FLAGS_PROBE is a relay-path liveness
+     * check, never a real ethernet frame. If it is the echo we ourselves sent
+     * out (matching id seen through R), the R path is proven. Otherwise (a peer
+     * sent us a probe) reflect it verbatim via R so that peer can complete its
+     * own proof. A probe is never delivered to the TAP device. */
+    if ( cmn->flags & N2N_FLAGS_PROBE )
+    {
+        if ( memcmp( pkt->dstMac, eee->device.mac_addr, N2N_MAC_SIZE ) == 0 )
+        {
+            /* addressed to us */
+            if ( from_relay && psize >= 4 )
+            {
+                uint32_t n;
+                memcpy( &n, payload, sizeof(n) );
+                if ( n == eee->relay_probe_n )
+                {
+                    eee->relay_proven = now;
+                    traceEvent( TRACE_NORMAL, "R-relay: PROBE echo %08x via R - relay proven",
+                                (unsigned)n );
+                }
+            }
+            /* reflect back to the sender unless this was our own expected echo
+             * (avoids an infinite echo loop between the two peers). */
+            if ( eee->relay_valid && eee->relay_sock.family != 0 )
+            {
+                int is_own_echo = 0;
+                if ( psize >= 4 )
+                {
+                    uint32_t n;
+                    memcpy( &n, payload, sizeof(n) );
+                    is_own_echo = ( n == eee->relay_probe_n && from_relay );
+                }
+                if ( !is_own_echo )
+                {
+                    uint8_t ebuf[N2N_PKT_BUF_SIZE];
+                    size_t ei = 0;
+                    n2n_common_t ec;
+                    n2n_PACKET_t ep;
+                    memset( &ec, 0, sizeof(ec) );
+                    ec.ttl = N2N_DEFAULT_TTL;
+                    ec.pc = n2n_packet;
+                    ec.flags = N2N_FLAGS_PROBE;
+                    memcpy( ec.community, cmn->community, N2N_COMMUNITY_SIZE );
+                    memset( &ep, 0, sizeof(ep) );
+                    memcpy( ep.srcMac, eee->device.mac_addr, N2N_MAC_SIZE );
+                    memcpy( ep.dstMac, pkt->srcMac, N2N_MAC_SIZE );
+                    ep.sock.family = 0;
+                    ep.transform = pkt->transform;
+                    encode_PACKET( ebuf, &ei, &ec, &ep );
+                    memcpy( ebuf + ei, payload, psize );
+                    ei += psize;
+                    sendto_sock( sock_for_dest(eee, &eee->relay_sock),
+                                 ebuf, ei, &eee->relay_sock );
+                }
+            }
+        }
+        return 0; /* probe never enters the TAP device */
+    }
 
     if (from_supernode) {
         ++(eee->rx_sup);
