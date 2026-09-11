@@ -710,6 +710,7 @@ struct n2n_sn
     n2n_trans_op_t      transop[N2N_MAX_TRANSFORMS];
     int                 ipv4_available; /* 0=unavailable, 1=available */
     int                 ipv6_available; /* 0=unavailable, 1=available */
+    int                 relay_advert_enabled; /* 1=advertise community relay R (default), 0=off */
     /* Traffic stats and rate limiting */
     int                    traffic_stats_enabled;
     char                   stats_config_path[256];
@@ -1009,6 +1010,7 @@ static int init_sn( n2n_sn_t * sss )
             ws_init(&sss->ws_conns[wi]);
     }
     sss->edges = NULL;
+    sss->relay_advert_enabled = 1; /* community relay advertisement ON by default */
     /* Initialize transforms - required to decode encrypted packets */
     transop_null_init(    &(sss->transop[N2N_TRANSOP_NULL_IDX]) );
     transop_twofish_init( &(sss->transop[N2N_TRANSOP_TF_IDX])  );
@@ -2510,20 +2512,28 @@ static int is_relay_capable( const struct peer_info * peer )
 }
 
 /* Pick the community's relay R among registered edges. Excludes a given MAC
- * (e.g. the registering party) so R never relays for itself. Newest peer
- * first (edges list is latest-first). Returns NULL if none eligible. */
+ * (e.g. the registering party) so R never relays for itself. Among relay-capable
+ * peers, priority follows the edges' declared willingness: eager (2) first,
+ * default (1) next, unwilling (0) only as last resort. Newest peer first (edges
+ * list is latest-first). Returns NULL if none eligible. */
 static struct peer_info * find_community_relay( n2n_sn_t *sss,
                                                 const n2n_community_t community,
                                                 const n2n_mac_t exclude_mac )
 {
     struct peer_info * scan;
+    struct peer_info * best_default = NULL; /* willing==1 */
+    struct peer_info * best_unwilling = NULL; /* willing==0 */
     for ( scan = sss->edges; scan; scan = scan->next )
     {
         if ( memcmp(scan->mac_addr, exclude_mac, N2N_MAC_SIZE) == 0 ) continue;
         if ( memcmp(scan->community_name, community, sizeof(n2n_community_t)) != 0 ) continue;
-        if ( is_relay_capable(scan) ) return scan;
+        if ( !is_relay_capable(scan) ) continue;
+        if ( scan->relay_willing == 2 ) return scan;       /* eager: prefer immediately */
+        else if ( scan->relay_willing == 1 ) { if (!best_default) best_default = scan; }
+        else                                              { if (!best_unwilling) best_unwilling = scan; }
     }
-    return NULL;
+    if ( best_default ) return best_default;
+    return best_unwilling;
 }
 
 /* Send one PEER_INFO telling <dest> that <relay> is the community relay R.
@@ -2575,6 +2585,10 @@ static void advertise_relay_on_pair( n2n_sn_t *sss,
                                      const n2n_mac_t req_mac,
                                      const n2n_mac_t tgt_mac )
 {
+    /* Whole-relay feature switch: when the admin disabled community relay
+     * advertisement, never pick/announce an R and stay on plain SN relay. */
+    if ( !sss->relay_advert_enabled ) return;
+
     struct peer_info * req = find_peer_by_mac( sss->edges, req_mac );
     if ( !req ) return;
 
@@ -3589,6 +3603,22 @@ static int process_udp( n2n_sn_t * sss,
         if ( is_new_edge )
             send_fc_probe_request( sss, reg.edgeMac, &(ack.sock), now );
 
+        /* Remember the edge's relay willingness so find_community_relay can
+         * prefer eager / skip unwilling candidates. Default (neither bit)=1. */
+        if (!query_only)
+        {
+            struct peer_info *w_edge = find_peer_by_mac( sss->edges, reg.edgeMac );
+            if ( w_edge )
+            {
+                if ( reg.aflags & N2N_AFLAGS_RELAY_WILLING_NO )
+                    w_edge->relay_willing = 0;
+                else if ( reg.aflags & N2N_AFLAGS_RELAY_WILLING_YES )
+                    w_edge->relay_willing = 2;
+                else
+                    w_edge->relay_willing = 1;
+            }
+        }
+
         /* Set assigned IP in ACK */
         if (!query_only && use_request_ip) {
             struct peer_info *edge_peer = find_peer_by_mac(sss->edges, reg.edgeMac);
@@ -3719,6 +3749,7 @@ static void help(int argc, char * const argv[])
     fprintf( stderr, "-t <port>\tSet management UDP port to <port> (default: 5646).\n" );
 #endif
     fprintf( stderr, "-v        \tIncrease verbosity. Can be used multiple times.\n" );
+    fprintf( stderr, "-Z <0|1>  \tRelay support: 0 = disable, 1 = enable (default).\n" );
     fprintf( stderr, "-h        \tThis help message.\n" );
     fprintf( stderr, "\n" );
 }
@@ -3734,6 +3765,7 @@ static const struct option long_options[] = {
   { "verbose",         no_argument,       NULL, 'v' },
   { "ipv4",            no_argument,       NULL, '4' },
   { "ipv6",            no_argument,       NULL, '6' },
+  { "relay",           required_argument, NULL, 'Z' },  /* 0=disable community relay R, else support */
   { NULL,              0,                 NULL,  0  }
 };
 
@@ -3792,7 +3824,7 @@ int main( int argc, char * const argv[] )
     {
         int opt;
 
-        while((opt = getopt_long(argc, argv, "ft:l:c:46vhE:B:b:", long_options, NULL)) != -1)
+        while((opt = getopt_long(argc, argv, "ft:l:c:46vhE:B:b:Z:", long_options, NULL)) != -1)
         {
             switch (opt)
             {
@@ -3854,6 +3886,11 @@ int main( int argc, char * const argv[] )
                 exit(0);
             case 'v': /* verbose */
                 ++traceLevel;
+                break;
+            case 'Z': /* 0=disable community relay R, 1=support (default) */
+                sss.relay_advert_enabled = ( (!optarg) || atoi(optarg) != 0 ) ? 1 : 0;
+                if ( !sss.relay_advert_enabled )
+                    traceEvent(TRACE_NORMAL, "Community relay advertisement disabled (-Z 0)" );
                 break;
             }
         }

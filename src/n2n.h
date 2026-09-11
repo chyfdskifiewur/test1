@@ -294,6 +294,7 @@ struct peer_info {
     uint8_t             p2p_is_lan;        /* 1=LAN P2P, set by edge.c at REGISTER_SUPER_ACK */
     uint8_t             same_lan_as_sn;    /* 1 if edge is in same LAN as supernode */
     time_t              relay_adv_time;    /* sn: last time this edge was advertised relay R (throttle) */
+    uint8_t             relay_willing;     /* sn: edge's willingness to act as relay R: 0=no,1=default,2=yes */
     /* Compact packet protocol support (version 0xE5 header) */
     uint8_t             compact_capable;   /* 1=understands compact format, 0=legacy/unknown */
     uint16_t            transform_id;      /* transform ID learned from PACKET headers (for SN legacy conversion) */
@@ -549,14 +550,13 @@ struct n2n_edge
      * P2P cleanup so the relay path survives peer-table churn. */
     struct peer_info *  relay_peers;
 
-    /* R-relay probe (client side): before switching a relayed flow off the
-     * supernode, A sends flagged PROBE PACKETs via R and only trusts R once a
-     * matching echo comes back from the peer THROUGH R (from_relay). */
-    uint32_t            relay_probe_n;           /* random id of the current probe */
-    time_t              relay_probe_start;      /* when R probing began (3s delay gate) */
-    time_t              relay_probe_next;       /* when to send the next probe */
-    uint8_t             relay_probe_sent;       /* how many probes have been sent (cap 3) */
-    uint8_t             relay_giveup;           /* 1=3 probes no echo: drop R, stay on SN */
+    /* Relay client state: relay_proven is refreshed by any frame received
+     * THROUGH the relay; the RELAY_PROVEN_SECS window in check_relay then
+     * detects a dead relay and falls back to the supernode, retrying it every
+     * relay_probe_next period. */
+    time_t              relay_probe_next;       /* when to retry a dead relay */
+    uint8_t             relay_giveup;           /* 1=relay deemed dead, stay on SN until retry */
+    uint8_t             relay_willing;          /* advertised to SN for relay selection: 0/1/2 */
 
     struct peer_info *  known_peers;
     struct peer_info *  pending_peers;

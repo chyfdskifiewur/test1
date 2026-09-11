@@ -340,6 +340,7 @@ static int edge_init(n2n_edge_t * eee)
 #endif
     memset(eee, 0, sizeof(n2n_edge_t));
     eee->start_time = n2n_now();
+    eee->relay_willing = 1; /* default: this edge "can be" a community relay */
 
     transop_null_init(    &(eee->transop[N2N_TRANSOP_NULL_IDX]) );
     transop_twofish_init( &(eee->transop[N2N_TRANSOP_TF_IDX]  ) );
@@ -837,6 +838,7 @@ static void help() {
     printf("-T <token>               | Supernode registration token (ASCII, max 32).\n");
     printf("-v                       | Make more verbose. Repeat as required.\n");
     printf("-w                       | WebSocket mode: relay via supernode over WS (TCP), disable P2P.\n");
+    printf("-Z <0|1|2>               | Relay willingness: 0 = unwilling, 1 = default, 2 = willing.\n");
     printf("-h                       | Show this help message.\n");
 
     printf("\nEnvironment variables:\n");
@@ -1423,6 +1425,14 @@ static void send_register_super( n2n_edge_t * eee,
         }
     }
 
+    /* Relay willingness advertised to SN for community-relay selection:
+     * 0=unwilling, 1=default (no bit sent), 2=willing preferred. Always sent,
+     * independent of the edge's own NAT type. */
+    if ( eee->relay_willing == 0 )
+        reg.aflags |= N2N_AFLAGS_RELAY_WILLING_NO;
+    else if ( eee->relay_willing == 2 )
+        reg.aflags |= N2N_AFLAGS_RELAY_WILLING_YES;
+
     /* Ask for a NAT bounce test on every registration while the type is not
      * final yet; the sn replies from its helper socket before ACKing. */
     if ( !eee->use_ws &&
@@ -1988,10 +1998,10 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
  * P2P link is established the relay is no longer needed, so we stop servicing R
  * and let its own copy age out (R-RELAY design: "direct success -> leave R"). */
 
-/* How long a proven R path stays "trusted" without further traffic through R.
- * If no frame arrives via R for this long, R is assumed dead and the edge
- * falls back to the supernode (and periodically retries R). */
-#define RELAY_PROVEN_SECS   10
+/* How long a proven relay path stays "trusted" without further traffic through
+     * it. If no frame arrives via the relay for this long, the relay is assumed
+     * dead and the edge falls back to the supernode (and periodically retries). */
+#define RELAY_PROVEN_SECS   3
 
 static void check_relay( n2n_edge_t * eee, time_t now )
 {
@@ -2009,7 +2019,7 @@ static void check_relay( n2n_edge_t * eee, time_t now )
             {
                 macstr_t mb;
                 *pp = rp->next;
-                traceEvent( TRACE_INFO, "R-RELAY: drop stale member %s",
+                traceEvent( TRACE_INFO, "relay: drop stale member %s",
                             macaddr_str( mb, rp->mac_addr ) );
                 free( rp );
             }
@@ -2034,6 +2044,7 @@ static void check_relay( n2n_edge_t * eee, time_t now )
         if (scan) { /* some P2P data path is up -> no more relaying needed */
             eee->relay_valid = 0;
             eee->relay_proven = 0;
+            traceEvent( TRACE_NORMAL, "relay: P2P direct up - leaving relay" );
             return;
         }
     }
@@ -2048,7 +2059,7 @@ static void check_relay( n2n_edge_t * eee, time_t now )
         eee->relay_proven = 0;
         eee->relay_giveup  = 1;
         eee->relay_probe_next = now + 35;
-        traceEvent( TRACE_NORMAL, "R-relay: no frame via R for %us - falling back to SN",
+        traceEvent( TRACE_NORMAL, "relay: no frame via relay for %us - falling back to SN",
                     RELAY_PROVEN_SECS );
     }
     /* periodic retry: give R another chance after it was marked dead. */
@@ -2056,21 +2067,16 @@ static void check_relay( n2n_edge_t * eee, time_t now )
     {
         eee->relay_giveup = 0;
         eee->relay_probe_next = now + 35;
-        eee->relay_probe_sent = 0;
-        eee->relay_probe_start = 0;
-        traceEvent( TRACE_NORMAL, "R-relay: retrying R" );
+        traceEvent( TRACE_NORMAL, "relay: retrying relay" );
     }
 
-    /* Keep R's copy of our socket alive (also registers us to R initially). */
+    /* Keep R's copy of our socket alive (also registers us to R initially).
+     * No heartbeat log here — R state transitions are logged once at the
+     * switch points (enable / prove / fallback / retry), not every 3s. */
     if ( eee->relay_sock.family != 0 && (now - eee->relay_last_reg) >= 3 )
     {
-        n2n_sock_str_t rsbuf;
         eee->relay_last_reg = now;
         send_register( eee, &eee->relay_sock );
-        traceEvent( TRACE_NORMAL, "R-relay: reg to %s proven=%u valid=%u",
-                    sock_to_cstr( rsbuf, &eee->relay_sock ),
-                    (unsigned)(eee->relay_proven != 0),
-                    (unsigned)eee->relay_valid );
     }
 }
 
@@ -3026,52 +3032,11 @@ static const struct option long_options[] = {
   { "verbose",         no_argument,       NULL, 'v' },
   { "bypass",          optional_argument, NULL, 'b' },
   { "gaming",          no_argument,       NULL, 'G' },
+  { "relay-willing",   required_argument, NULL, 'Z' }, /* 0=unwilling,1=default,2=eager as relay R */
   { NULL,              0,                 NULL,  0  }
 };
 
 /* ***************************************************** */
-
-/* Send a flagged RELAY probe to <dstMac> via R. The probe carries a random
- * 4-byte id in its (plain) payload; the peer reflects it verbatim through R,
- * and a matching echo seen from relay_sock proves the R path end-to-end. */
-static void send_relay_probe( n2n_edge_t * eee, const n2n_mac_t dstMac )
-{
-    if ( !eee->relay_valid || eee->relay_sock.family == 0 )
-        return;
-
-    uint8_t pktbuf[N2N_PKT_BUF_SIZE];
-    size_t idx = 0;
-    n2n_common_t cmn;
-    n2n_PACKET_t pkt;
-    uint32_t n;
-
-    n = (uint32_t)rand();
-    eee->relay_probe_n = n;   /* remember what we are waiting to see echoed */
-
-    memset( &cmn, 0, sizeof(cmn) );
-    cmn.ttl = N2N_DEFAULT_TTL;
-    cmn.pc = n2n_packet;
-    cmn.flags = N2N_FLAGS_PROBE;
-    memcpy( cmn.community, eee->community_name, N2N_COMMUNITY_SIZE );
-
-    memset( &pkt, 0, sizeof(pkt) );
-    memcpy( pkt.srcMac, eee->device.mac_addr, N2N_MAC_SIZE );
-    memcpy( pkt.dstMac, dstMac, N2N_MAC_SIZE );
-    pkt.sock.family = 0;
-    pkt.transform = eee->transop[eee->tx_transop_idx].transform_id;
-
-    encode_PACKET( pktbuf, &idx, &cmn, &pkt );
-    memcpy( pktbuf + idx, &n, sizeof(n) );
-    idx += sizeof(n);
-
-    {
-        macstr_t mb;
-        traceEvent( TRACE_INFO, "R-relay: PROBE %08x to %s via R",
-                    (unsigned)n, macaddr_str( mb, dstMac ) );
-    }
-
-    sendto_sock( sock_for_dest(eee, &eee->relay_sock), pktbuf, idx, &eee->relay_sock );
-}
 
 /* ***************************************************** */
 
@@ -3163,19 +3128,19 @@ static int send_PACKET( n2n_edge_t * eee,
             ++(eee->tx_sup); eee->super_tx_bytes += pktlen;
         }
     } else {
-        /* No direct P2P to this MAC. If a community relay R is assigned and the
-         * target is not broadcastable, route via R. While the R path is unproven
-         * (or recently silent) we dual-send R+SN so no data is lost; once a frame
-         * actually comes back through R (relay_proven, 10s window) we use R only.
-         * A dead R (no frame via R for RELAY_PROVEN_SECS) is handled in
-         * check_relay, which flags giveup and falls back to SN. R send failure
-         * here also falls back to SN. */
+        /* No direct P2P to this MAC. If a community relay is assigned and the
+         * target is not broadcastable, route via relay. While the relay path is
+         * unproven (or recently silent) we dual-send relay+SN so no data is lost;
+         * once a frame actually comes back through relay (relay_proven window) we
+         * use relay only. A dead relay (no frame via relay for RELAY_PROVEN_SECS)
+         * is handled in check_relay, which flags giveup and falls back to SN.
+         * Relay send failure here also falls back to SN. */
         int via_relay = (eee->relay_valid && !is_multi_broadcast(dstMac));
         if (via_relay && !eee->relay_giveup)
         {
             time_t rnow = n2n_now();
-            /* proven only while actively hearing from R; a dead R cannot
-             * permanently strand the flow thanks to the 10s window. */
+            /* proven only while actively hearing from relay; a dead relay cannot
+             * permanently strand the flow thanks to the RELAY_PROVEN_SECS window. */
             int proven = ( eee->relay_proven != 0 &&
                           (rnow - eee->relay_proven) <= RELAY_PROVEN_SECS );
             if (proven)
@@ -3593,7 +3558,7 @@ static int handle_PACKET( n2n_edge_t * eee,
             memset(&cmn2, 0, sizeof(cmn2));
             cmn2.ttl   = N2N_DEFAULT_TTL;
             cmn2.pc    = n2n_packet;
-            cmn2.flags = cmn->flags & N2N_FLAGS_PROBE; /* carry relay-probe marker through */
+            cmn2.flags = 0;
             memcpy(cmn2.community, cmn->community, sizeof(n2n_community_t));
             memcpy(&pkt2, pkt, sizeof(pkt2));
             encode_PACKET(fwd, &idx, &cmn2, &pkt2);
@@ -3601,7 +3566,7 @@ static int handle_PACKET( n2n_edge_t * eee,
                 memcpy(fwd + idx, payload, psize);
                 idx += psize;
             }
-            traceEvent(TRACE_DEBUG, "R-RELAY: forward %s -> %s",
+            traceEvent(TRACE_DEBUG, "relay: forward %s -> %s",
                        macaddr_str(mbA, pkt->srcMac), macaddr_str(mbB, pkt->dstMac));
             sendto_sock(sock_for_dest(eee, dst_sock), fwd, idx, dst_sock);
         }
@@ -3617,67 +3582,13 @@ static int handle_PACKET( n2n_edge_t * eee,
      * to end — the sender may then drop the supernode copy. */
     uint8_t from_relay = ( eee->relay_valid && tx_sender &&
                         sock_equal( &eee->relay_sock, tx_sender ) == 0 ) ? 1 : 0;
-    if (from_relay)
-        eee->relay_proven = now;
-
-    /* R-RELAY probe: a PACKET flagged N2N_FLAGS_PROBE is a relay-path liveness
-     * check, never a real ethernet frame. If it is the echo we ourselves sent
-     * out (matching id seen through R), the R path is proven. Otherwise (a peer
-     * sent us a probe) reflect it verbatim via R so that peer can complete its
-     * own proof. A probe is never delivered to the TAP device. */
-    if ( cmn->flags & N2N_FLAGS_PROBE )
+    if (from_relay && eee->relay_proven == 0)
     {
-        if ( memcmp( pkt->dstMac, eee->device.mac_addr, N2N_MAC_SIZE ) == 0 )
-        {
-            /* addressed to us */
-            if ( from_relay && psize >= 4 )
-            {
-                uint32_t n;
-                memcpy( &n, payload, sizeof(n) );
-                if ( n == eee->relay_probe_n )
-                {
-                    eee->relay_proven = now;
-                    traceEvent( TRACE_NORMAL, "R-relay: PROBE echo %08x via R - relay proven",
-                                (unsigned)n );
-                }
-            }
-            /* reflect back to the sender unless this was our own expected echo
-             * (avoids an infinite echo loop between the two peers). */
-            if ( eee->relay_valid && eee->relay_sock.family != 0 )
-            {
-                int is_own_echo = 0;
-                if ( psize >= 4 )
-                {
-                    uint32_t n;
-                    memcpy( &n, payload, sizeof(n) );
-                    is_own_echo = ( n == eee->relay_probe_n && from_relay );
-                }
-                if ( !is_own_echo )
-                {
-                    uint8_t ebuf[N2N_PKT_BUF_SIZE];
-                    size_t ei = 0;
-                    n2n_common_t ec;
-                    n2n_PACKET_t ep;
-                    memset( &ec, 0, sizeof(ec) );
-                    ec.ttl = N2N_DEFAULT_TTL;
-                    ec.pc = n2n_packet;
-                    ec.flags = N2N_FLAGS_PROBE;
-                    memcpy( ec.community, cmn->community, N2N_COMMUNITY_SIZE );
-                    memset( &ep, 0, sizeof(ep) );
-                    memcpy( ep.srcMac, eee->device.mac_addr, N2N_MAC_SIZE );
-                    memcpy( ep.dstMac, pkt->srcMac, N2N_MAC_SIZE );
-                    ep.sock.family = 0;
-                    ep.transform = pkt->transform;
-                    encode_PACKET( ebuf, &ei, &ec, &ep );
-                    memcpy( ebuf + ei, payload, psize );
-                    ei += psize;
-                    sendto_sock( sock_for_dest(eee, &eee->relay_sock),
-                                 ebuf, ei, &eee->relay_sock );
-                }
-            }
-        }
-        return 0; /* probe never enters the TAP device */
+        eee->relay_proven = now;
+        traceEvent( TRACE_NORMAL, "relay: relay path proven" );
     }
+    else if (from_relay)
+        eee->relay_proven = now;
 
     if (from_supernode) {
         ++(eee->rx_sup);
@@ -4778,7 +4689,7 @@ process_n2n_packet:
                         if (sender.family == AF_INET) rp->sock = sender;
                         else rp->sock6 = sender;
                         rp->last_seen = n2n_now();
-                        traceEvent(TRACE_INFO, "R-RELAY: member %s at %s",
+                        traceEvent(TRACE_INFO, "relay: member %s at %s",
                                    macaddr_str(mac_buf1, reg.srcMac),
                                    sock_to_cstr(sockbuf1, &sender));
                     }
@@ -4955,7 +4866,7 @@ process_n2n_packet:
                 eee->relay_sock = pi.sockets[0];
                 eee->relay_valid = 1;
                 eee->relay_last_reg = 0; /* register to R on next tick */
-                traceEvent(TRACE_INFO, "Rx PEER_INFO RELAY R=%s at %s",
+                traceEvent(TRACE_INFO, "Rx PEER_INFO RELAY relay=%s at %s",
                            macaddr_str(mac_buf1, pi.mac),
                            sock_to_cstr(sockbuf1, &pi.sockets[0]));
             }
@@ -6663,7 +6574,7 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
     optarg = NULL;
     while((opt = getopt_long(argc,
         argv,
-        "46K:k:a:c:Eu:g:m:M:d:l:p:fvhrt:R:A:b::wGT:", long_options, NULL
+        "46K:k:a:c:Eu:g:m:M:d:l:p:fvhrt:R:A:b::wGT:Z:", long_options, NULL
     )) != EOF) {
         switch (opt) {
         case '4':
@@ -6845,6 +6756,21 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
 
         case 'G': /* Gaming mode: actively probe all peers on start */
             eee.enable_gaming_mode = 1;
+            break;
+
+        case 'Z': /* relay willingness: 0=unwilling, 1=default, 2=eager */
+            if (!optarg) {
+                fprintf(stderr, "Error: -Z requires a value of 0, 1 or 2\n");
+                exit(1);
+            }
+            {
+                int w = atoi(optarg);
+                if (w < 0 || w > 2) {
+                    fprintf(stderr, "Error: invalid -Z value %s (use 0, 1 or 2)\n", optarg);
+                    exit(1);
+                }
+                eee.relay_willing = w;
+            }
             break;
 
         } /* end switch */

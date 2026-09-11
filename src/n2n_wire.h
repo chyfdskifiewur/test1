@@ -68,9 +68,6 @@ typedef enum n2n_pc n2n_pc_t;
 #define N2N_FLAGS_OPTIONS               0x0080
 #define N2N_FLAGS_SOCKET                0x0040
 #define N2N_FLAGS_FROM_SUPERNODE        0x0020
-#define N2N_FLAGS_PROBE                 0x0100 /* PACKET flagged as R-relay probe:
-                                                  receiver reflects it (echo) via R to prove the
-                                                  R link end-to-end; never delivered to TAP */
 
 /* The bits in flag that are the packet type */
 #define N2N_FLAGS_TYPE_MASK             0x001f  /* 0 - 31 */
@@ -179,6 +176,9 @@ typedef struct n2n_PACKET n2n_PACKET_t;
 #define N2N_AFLAGS_NAT_RESTRICTED 0x0200  /* edge reports address-restricted cone NAT */
 #define N2N_AFLAGS_NAT_PORT_RESTRICT 0x0400 /* edge reports port-restricted NAT */
 #define N2N_AFLAGS_FORCE_PEER_INFO 0x0008  /* force supernode to push all peer info */
+#define N2N_AFLAGS_RELAY_WILLING_NO  0x0800 /* edge is unwilling to act as relay R (SN picks it last) */
+#define N2N_AFLAGS_RELAY_WILLING_YES 0x1000 /* edge is willing to act as relay R (SN prefers it) */
+                                        /* neither set = default "can be" relay (secondary) */
 #define N2N_AFLAGS_QUERY_ONLY     0x0010  /* REGISTER_SUPER is a one-shot query
                                              (e.g. ask sn2 for sn1's current address):
                                              supernode replies with an ACK but does
