@@ -1799,7 +1799,6 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
 #define KEEPALIVE_MAX_FAILS       3   /* fall back to relay after this many consecutive failures */
 #define KEEPALIVE_TOTAL_TIMEOUT   (KEEPALIVE_IDLE_SECONDS + KEEPALIVE_RETRY_INTERVAL * KEEPALIVE_MAX_FAILS)  /* 14s */
 #define P2P_EST_GRACE           1    /* sec: after P2P established, keep relay for this long */
-#define RELAY_PROVEN_SECS      15    /* a frame received through R this recently proves the relay path */
 
 static void update_peer_address(n2n_edge_t * eee,
                                 uint8_t from_supernode,
@@ -3064,20 +3063,15 @@ static int send_PACKET( n2n_edge_t * eee,
         }
     } else {
         /* No direct P2P: when a community relay R is assigned, dual-send —
-         * via R, keeping the supernode copy as fallback until a frame actually
-         * comes back through R (relay_proven); once proven, relay-only.
-         * Without R, the supernode carries the traffic. */
+         * via R, keeping the supernode copy as fallback until a frame
+         * actually comes back through R (relay_proven != 0); once proven,
+         * relay-only (supernode forwarding off). R failure also falls back. */
         int via_relay = (eee->relay_valid && !is_multi_broadcast(dstMac));
         ssize_t r = -1;
-        if (via_relay) {
+        if (via_relay)
             r = sendto_sock( sock_for_dest(eee, &eee->relay_sock),
                              pktbuf, pktlen, &eee->relay_sock );
-            if (r > 0)
-                eee->sn_relay_fails = 0;
-        }
-        int proven = ( eee->relay_proven != 0 &&
-                       (now - eee->relay_proven) <= RELAY_PROVEN_SECS );
-        if (!proven || r <= 0) {
+        if (eee->relay_proven == 0 || r <= 0) {
             /* Not proven yet, or R failed: keep the supernode copy. */
             if (edge_send_to_sn(eee, pktbuf, pktlen) <= 0) {
                 /* Consecutive failures trigger supernode re-registration */
