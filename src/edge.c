@@ -3566,7 +3566,8 @@ static int handle_PACKET( n2n_edge_t * eee,
                           const n2n_sock_t * orig_sender,
                           const n2n_sock_t * tx_sender,
                           uint8_t * payload,
-                          size_t psize )
+                          size_t psize,
+                          const uint8_t * raw_hdr )
 {
     ssize_t             data_sent_len;
     uint8_t             from_supernode;
@@ -3585,8 +3586,16 @@ static int handle_PACKET( n2n_edge_t * eee,
     /* Relay mode: acting as the community relay peer (mini-SN). If this PACKET
      * is aimed at a member that registered to us (not at ourselves), relay the
      * already encrypted payload to that member unchanged — the relay never
-     * decrypts, so the e2e community transform is preserved. */
+     * decrypts, so the e2e community transform is preserved.
+     *
+     * Forwarding is deliberately near zero-cost: the frame is NOT re-encoded
+     * and the payload is NOT copied. We only decrement the TTL (supernode
+     * behaviour) and set N2N_FLAGS_FROM_RELAY in place inside the received
+     * datagram, which is enough for the destination to classify it as relayed.
+     * raw_hdr is NULL for locally reconstructed frames (compact) which cannot
+     * be forwarded in place — they are skipped here. */
     if ( eee->relay_mode &&
+         raw_hdr != NULL &&
          !is_multi_broadcast(pkt->dstMac) &&
          memcmp(pkt->dstMac, eee->device.mac_addr, N2N_MAC_SIZE) != 0 )
     {
@@ -3607,40 +3616,64 @@ static int handle_PACKET( n2n_edge_t * eee,
             if (dst && dst->sock.family != 0) dst_sock = &dst->sock;
         }
         PEERS_UNLOCK(eee);
-        if (dst_sock) {
-            n2n_common_t cmn2;
-            n2n_PACKET_t pkt2;
-            uint8_t fwd[N2N_PKT_BUF_SIZE];
-            size_t idx = 0;
+        if (dst_sock)
+        {
+            /* Wire layout: version@0, ttl@1, flags@2-3 (big-endian), community@4..19. */
+            uint8_t *hdr = (uint8_t *)raw_hdr;
             macstr_t mbA, mbB;
-            memset(&cmn2, 0, sizeof(cmn2));
-            cmn2.ttl   = N2N_DEFAULT_TTL;
-            cmn2.pc    = n2n_packet;
-            cmn2.flags = 0;
-            memcpy(cmn2.community, cmn->community, sizeof(n2n_community_t));
-            memcpy(&pkt2, pkt, sizeof(pkt2));
-            encode_PACKET(fwd, &idx, &cmn2, &pkt2);
-            if (idx + psize <= N2N_PKT_BUF_SIZE) {
-                memcpy(fwd + idx, payload, psize);
-                idx += psize;
+            ssize_t fwd_len = psize + (ssize_t)(payload - raw_hdr);
+            ssize_t sent;
+            uint16_t fl;
+
+            /* Refuse an already-dead frame, then decrement exactly like the
+             * supernode so a relayed copy cannot resurrect an exhausted TTL. */
+            if ( cmn->ttl < 1 )
+            {
+                traceEvent( TRACE_DEBUG, "relay: expired TTL, dropping %s -> %s",
+                            macaddr_str( mbA, pkt->srcMac ), macaddr_str( mbB, pkt->dstMac ) );
+                return retval;
             }
-            traceEvent(TRACE_DEBUG, "relay: forward %s -> %s",
-                       macaddr_str(mbA, pkt->srcMac), macaddr_str(mbB, pkt->dstMac));
-            sendto_sock(sock_for_dest(eee, dst_sock), fwd, idx, dst_sock);
+            hdr[1] = cmn->ttl - 1;
+
+            /* Mark the frame as relayed so the destination can classify it
+             * without relying on transport-socket comparison. */
+            fl = (uint16_t)(((uint16_t)hdr[2] << 8) | hdr[3]);
+            fl |= N2N_FLAGS_FROM_RELAY;
+            hdr[2] = (uint8_t)(fl >> 8);
+            hdr[3] = (uint8_t)(fl & 0xff);
+
+            traceEvent( TRACE_DEBUG, "relay: forward %s -> %s",
+                        macaddr_str( mbA, pkt->srcMac ), macaddr_str( mbB, pkt->dstMac ) );
+
+            sent = sendto_sock( sock_for_dest( eee, dst_sock ), raw_hdr, (size_t)fwd_len, dst_sock );
+            /* Failure handling aligned with the supernode's try_forward():
+             * EAGAIN is an expected transient drop, real failures are logged. */
+            if ( sent != fwd_len )
+            {
+                int err = (int)errno;
+                if ( err == EAGAIN || err == EWOULDBLOCK )
+                    traceEvent( TRACE_DEBUG, "relay: forward %s -> %s EAGAIN (drop)",
+                                macaddr_str( mbA, pkt->srcMac ), macaddr_str( mbB, pkt->dstMac ) );
+                else
+                    traceEvent( TRACE_WARNING, "relay: forward to %s FAILED (%d: %s)",
+                                macaddr_str( mbB, pkt->dstMac ), err, strerror( err ) );
+            }
         }
         return retval;
     }
 
-    /* Relay: a PACKET whose transport source is the relay peer is a *relayed*
-     * frame (the relay forwards the payload untouched; the header's embedded
-     * sock is the original sender, so only the transport source identifies the
-     * relay). Classify it like a supernode-relayed frame below so we never
-     * mis-mark the data peer as directly connected (which would disarm the
-     * relay / black-hole traffic). A frame reaching us through the relay also
-     * proves the relay path end to end — the sender may then drop the
-     * supernode copy. */
-    uint8_t from_relay = ( eee->relay_valid && tx_sender &&
-                        sock_equal( &eee->relay_sock, tx_sender ) == 0 ) ? 1 : 0;
+    /* Relay: a frame marked N2N_FLAGS_FROM_RELAY was forwarded by the
+     * community relay peer (mini-SN). A frame whose transport source is the
+     * relay socket is kept as a compatibility fallback for older relays that
+     * have not been upgraded to set the flag. Classify either like a
+     * supernode-relayed frame below so we never mis-mark the data peer as
+     * directly connected (which would disarm the relay / black-hole traffic).
+     * A frame reaching us through the relay also proves the relay path end to
+     * end — the sender may then drop the supernode copy. */
+    uint8_t from_relay = ( cmn->flags & N2N_FLAGS_FROM_RELAY ) ? 1 : 0;
+    if ( !from_relay && eee->relay_valid && tx_sender &&
+         sock_equal( &eee->relay_sock, tx_sender ) == 0 )
+        from_relay = 1;
     if (from_relay && eee->relay_proven == 0)
     {
         char vip[16]; n2n_sock_str_t relbuf;
@@ -4716,7 +4749,7 @@ process_n2n_packet:
                    sock_to_cstr(sockbuf1, &sender),
                    sock_to_cstr(sockbuf2, orig_sender) );
 
-        handle_PACKET( eee, &cmn, &compact_pkt, orig_sender, &sender, udp_buf + idx, recvlen - idx );
+        handle_PACKET( eee, &cmn, &compact_pkt, orig_sender, &sender, udp_buf + idx, recvlen - idx, NULL );
         traceEvent(TRACE_DEBUG, "handle_PACKET returned (compact)");
         return 1;
     }
@@ -4754,7 +4787,7 @@ process_n2n_packet:
                        sock_to_cstr(sockbuf1, &sender),
                        sock_to_cstr(sockbuf2, orig_sender) );
 
-            handle_PACKET( eee, &cmn, &pkt, orig_sender, &sender, udp_buf + idx, recvlen - idx );
+            handle_PACKET( eee, &cmn, &pkt, orig_sender, &sender, udp_buf + idx, recvlen - idx, udp_buf );
             traceEvent(TRACE_DEBUG, "handle_PACKET returned");
         }
         else if(msg_type == MSG_TYPE_REGISTER)
