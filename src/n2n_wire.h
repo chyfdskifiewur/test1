@@ -437,6 +437,9 @@ size_t decode_PACKET( n2n_PACKET_t * pkt,
 #define N2N_AFLAGS_SAME_LAN_AS_SN  0x0008  /* peer is in same LAN as supernode, replace IP with SN's public IP */
 #define N2N_AFLAGS_RELAY           0x0010  /* this peer is the community's relay R (mini-SN):
                                               A/B must register to it and use it when direct fails */
+#define N2N_AFLAGS_RELAY_MEMBER    0x0020  /* sent to relay R only: this peer will register to R.
+                                              A NAT2 R pre-opens its NAT by sending a REGISTER
+                                              toward this peer's socket first */
 typedef struct n2n_PEER_INFO {
     uint16_t   aflags;       /* N2N_AFLAGS_LOCAL_SOCKET if sockets[1] valid, N2N_AFLAGS_IPV6_SOCKET if sock6 valid, N2N_AFLAGS_PUNCH_REQUEST if should punch, N2N_AFLAGS_SAME_LAN_AS_SN if same LAN as SN */
     n2n_mac_t  mac;

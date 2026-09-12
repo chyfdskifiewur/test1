@@ -2495,9 +2495,11 @@ static void push_nat_to_community( n2n_sn_t *sss,
 /* R-RELAY: ---- group relay R helpers (mini-SN) ----------------------------
  *
  * R is a community peer picked to relay traffic for members that cannot
- * P2P directly. R must be a "good" peer: measured cone NAT (NAT1) and holding
- * a usable public IPv4 socket, so A/B can reach it without punching. Address
- * rewriting / NAT2 R is intentionally left as the "else -> back to SN" path.
+ * P2P directly. R must be a "good" peer: cone NAT (NAT1 full-cone or NAT2
+ * addr-restr — both keep one mapping per socket, so the socket the SN sees
+ * is the socket members reach) and a usable public IPv4 socket. A NAT2 R
+ * cannot be reached first, so the SN also hints R about the pair and R
+ * pre-opens its NAT by sending them a REGISTER (send_relay_member_hint).
  * ------------------------------------------------------------------------ */
 
 /* A peer is relay-capable only if its extern addr is a public IPv4 and its
@@ -2514,25 +2516,26 @@ static int is_relay_capable( const struct peer_info * peer )
 /* Pick the community's relay R among registered edges. Excludes a given MAC
  * (e.g. the registering party) so R never relays for itself. Among relay-capable
  * peers, priority follows the edges' declared willingness: eager (2) first,
- * default (1/unknown) next; unwilling (0) is never picked, even if it is the
- * only eligible peer (SN falls back to plain SN relay in that case). Newest peer
- * first (edges list is latest-first). Returns NULL if none eligible. */
+ * default (1) next, unwilling (0) only as last resort. Newest peer first (edges
+ * list is latest-first). Returns NULL if none eligible. */
 static struct peer_info * find_community_relay( n2n_sn_t *sss,
                                                 const n2n_community_t community,
                                                 const n2n_mac_t exclude_mac )
 {
     struct peer_info * scan;
     struct peer_info * best_default = NULL; /* willing==1 */
+    struct peer_info * best_unwilling = NULL; /* willing==0 */
     for ( scan = sss->edges; scan; scan = scan->next )
     {
         if ( memcmp(scan->mac_addr, exclude_mac, N2N_MAC_SIZE) == 0 ) continue;
         if ( memcmp(scan->community_name, community, sizeof(n2n_community_t)) != 0 ) continue;
         if ( !is_relay_capable(scan) ) continue;
         if ( scan->relay_willing == 2 ) return scan;       /* eager: prefer immediately */
-        if ( scan->relay_willing == 0 ) continue;          /* unwilling: never pick, even if alone */
-        if ( !best_default ) best_default = scan;          /* willing==1 / unknown */
+        else if ( scan->relay_willing == 1 ) { if (!best_default) best_default = scan; }
+        else                                              { if (!best_unwilling) best_unwilling = scan; }
     }
-    return best_default;
+    if ( best_default ) return best_default;
+    return best_unwilling;
 }
 
 /* Send one PEER_INFO telling <dest> that <relay> is the community relay R.
@@ -2575,6 +2578,52 @@ static void advertise_relay_to( n2n_sn_t *sss,
     sn_send_to_peer( sss, dest, pibuf, pix );
 }
 
+/* NAT2 relay support: tell relay R that <member> is about to register to it,
+ * so R can pre-open its addr-restricted NAT by sending a REGISTER toward the
+ * member's public socket. Without it the member's REGISTER would be dropped
+ * by R's NAT and relaying could never start. Only public addresses are
+ * punchable from R; private-sock members (same LAN as sn) get no hint. */
+static void send_relay_member_hint( n2n_sn_t *sss,
+                                    const n2n_common_t * cmn,
+                                    struct peer_info * relay,
+                                    struct peer_info * member )
+{
+    n2n_common_t    pi_cmn;
+    n2n_PEER_INFO_t pi;
+    uint8_t         pibuf[N2N_SN_PKTBUF_SIZE];
+    size_t          pix = 0;
+    int             have_v4 = 0;
+
+    if ( !relay || !member ) return;
+
+    have_v4 = ( member->sock.family == AF_INET &&
+                !is_private_ipv4(member->sock.addr.v4) );
+    if ( !have_v4 && member->sock6.family != AF_INET6 )
+        return; /* nothing punchable */
+
+    memset(&pi_cmn, 0, sizeof(pi_cmn));
+    memset(&pi, 0, sizeof(pi));
+    pi_cmn.ttl   = N2N_DEFAULT_TTL;
+    pi_cmn.pc    = n2n_peer_info;
+    pi_cmn.flags = N2N_FLAGS_FROM_SUPERNODE;
+    memcpy(pi_cmn.community, cmn->community, sizeof(n2n_community_t));
+
+    memcpy(pi.mac, member->mac_addr, N2N_MAC_SIZE);
+    pi.aflags = N2N_AFLAGS_RELAY_MEMBER;
+    if ( have_v4 )
+        pi.sockets[0] = member->sock;
+    if ( member->sock6.family == AF_INET6 ) {
+        pi.aflags |= N2N_AFLAGS_IPV6_SOCKET;
+        pi.sock6 = member->sock6;
+        if ( !have_v4 )
+            pi.sockets[0] = member->sock6;
+    }
+    pi.aflags |= N2N_NAT_AFLAGS(member->nat_type);
+
+    encode_PEER_INFO( pibuf, &pix, &pi_cmn, &pi );
+    sn_send_to_peer( sss, relay, pibuf, pix );
+}
+
 /* When the supernode actually relays unicast traffic between <req_mac> and
  * <tgt_mac> ("communication attempt / failed direct"), advertise the community
  * relay R to both so they start registering to R and route through it.
@@ -2597,24 +2646,17 @@ static void advertise_relay_on_pair( n2n_sn_t *sss,
     /* R must be a proper third peer: neither the sender nor the target. */
     struct peer_info * relay = find_community_relay( sss, cmn->community, req_mac );
     if ( !relay || (memcmp(relay->mac_addr, tgt_mac, N2N_MAC_SIZE) == 0) )
-    {
-        /* Observability: relay relaying silently depends on this pick; when it
-         * fails the community quietly stays on SN relay forever. Warn at most
-         * once per minute so admins can see WHY no R is ever advertised. */
-        static time_t last_pick_warn = 0;
-        if ( now - last_pick_warn >= 60 )
-        {
-            last_pick_warn = now;
-            traceEvent( TRACE_NORMAL,
-                        "relay: no relay-capable peer for community (R needs NAT1/NAT2 + public IPv4, eager -Z 2 preferred)" );
-        }
         return; /* no good peer -> stay on plain SN relay */
-    }
     req->relay_adv_time = now;
 
     struct peer_info * tgt = find_peer_by_mac( sss->edges, tgt_mac );
     advertise_relay_to( sss, cmn, req, relay );
     if ( tgt ) advertise_relay_to( sss, cmn, tgt, relay );
+
+    /* NAT2 R cannot be reached first: hint R about both ends so it pre-opens
+     * its NAT toward them while they start registering. */
+    send_relay_member_hint( sss, cmn, relay, req );
+    if ( tgt ) send_relay_member_hint( sss, cmn, relay, tgt );
 }
 
 /** Examine a datagram and determine what to do with it.

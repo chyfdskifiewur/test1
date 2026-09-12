@@ -763,6 +763,8 @@ static void edge_deinit(n2n_edge_t * eee)
 
     clear_peer_list( &(eee->pending_peers) );
     clear_peer_list( &(eee->known_peers) );
+    clear_peer_list( &(eee->relay_peers) );
+    clear_peer_list( &(eee->relay_expected) );
 
     (eee->transop[N2N_TRANSOP_TF_IDX].deinit)(&eee->transop[N2N_TRANSOP_TF_IDX]);
     (eee->transop[N2N_TRANSOP_NULL_IDX].deinit)(&eee->transop[N2N_TRANSOP_NULL_IDX]);
@@ -2042,6 +2044,46 @@ static void check_relay( n2n_edge_t * eee, time_t now )
             else
                 pp = &rp->next;
         }
+
+        /* NAT2 support: expire expected members the SN stopped hinting (the
+         * pair went direct or left); hints refresh them every ~15s. */
+        pp = &eee->relay_expected;
+        while ( *pp )
+        {
+            struct peer_info *rp = *pp;
+            if ( (now - rp->last_seen) > 90 )
+            {
+                *pp = rp->next;
+                free( rp );
+            }
+            else
+                pp = &rp->next;
+        }
+
+        /* NAT2 support: an addr-restricted R only lets members' packets in
+         * from addresses it sent to itself, so keep sending a REGISTER toward
+         * every member (real sockets beat the SN hint: they are the exact
+         * transport sources of the members' REGISTERs). Also covers idle
+         * periods, when no relayed traffic would refresh the NAT permission. */
+        if ( (now - eee->relay_punch_last) >= 15 )
+        {
+            struct peer_info *rp;
+            eee->relay_punch_last = now;
+            for ( rp = eee->relay_peers; rp; rp = rp->next )
+            {
+                if ( rp->sock.family != 0 )
+                    send_register( eee, &rp->sock );
+                else if ( rp->sock6.family != 0 )
+                    send_register( eee, &rp->sock6 );
+            }
+            for ( rp = eee->relay_expected; rp; rp = rp->next )
+            {
+                if ( rp->sock.family != 0 )
+                    send_register( eee, &rp->sock );
+                else if ( rp->sock6.family != 0 )
+                    send_register( eee, &rp->sock6 );
+            }
+        }
         PEERS_UNLOCK(eee);
     }
 
@@ -2051,8 +2093,8 @@ static void check_relay( n2n_edge_t * eee, time_t now )
         struct peer_info *scan;
         PEERS_LOCK(eee);
         /* A/B are done with R only once a *data* peer (never R itself) has a
-         * direct P2P link. R is itself a direct-reachable peer (NAT1), so we
-         * must exclude relay_mac or R would disarm the relay immediately. */
+         * direct P2P link. R is itself a directly reachable peer (NAT1/NAT2),
+         * so we must exclude relay_mac or R would disarm the relay immediately. */
         for (scan = eee->known_peers; scan; scan = scan->next)
             if (scan->direct_seen != 0 &&
                 memcmp(scan->mac_addr, eee->relay_mac, N2N_MAC_SIZE) != 0) break;
@@ -2075,8 +2117,10 @@ static void check_relay( n2n_edge_t * eee, time_t now )
         eee->relay_proven = 0;
         eee->relay_giveup  = 1;
         eee->relay_probe_next = now + 35;
-        traceEvent( TRACE_NORMAL, "relay: relay silent %us - falling back to SN",
-                    RELAY_PROVEN_SECS );
+        {
+            traceEvent( TRACE_NORMAL, "relay: relay silent %us - falling back to SN",
+                        RELAY_PROVEN_SECS );
+        }
     }
     /* periodic retry: give R another chance after it was marked dead. */
     else if ( eee->relay_giveup && now >= eee->relay_probe_next )
@@ -2707,9 +2751,10 @@ static void nat_classify( n2n_edge_t * eee )
     new = N2N_NAT_NAME( new_type );
     eee->nat_type = new_type;
 
-    /* R-RELAY: a good peer (NAT1 / public address) self-enables acting as
-     * relay R when its NAT type is relay-eligible (N2N_NAT_RELAY_CAPABLE).
-     * Other NAT types intentionally keep the SN-relay fallback. */
+    /* R-RELAY: a good peer (NAT1/NAT2 with a public address) self-enables
+     * acting as relay R when its NAT type is relay-eligible
+     * (N2N_NAT_RELAY_CAPABLE). Other NAT types intentionally keep the
+     * SN-relay fallback. */
     {
         uint32_t ip = (eee->my_public_sock.family == AF_INET)
                     ? ((uint32_t)eee->my_public_sock.addr.v4[0] << 24) |
@@ -3608,18 +3653,10 @@ static int handle_PACKET( n2n_edge_t * eee,
         const char * where = relay_virt_ip_str( eee, vip, sizeof vip );
         if ( vip[0] == '-' ) where = sock_to_cstr( relbuf, &eee->relay_sock );
         eee->relay_proven = now;
-        /* A frame arriving via R proves the path live even while we are in
-         * giveup (e.g. the peer still uses R). Re-arm so our sending resumes
-         * via R and the loop sustains itself; otherwise proven would flip
-         * stale again 5s later and both ends starve each other's R path. */
-        eee->relay_giveup = 0;
         traceEvent( TRACE_NORMAL, "relay: relay path proven via %s", where );
     }
     else if (from_relay)
-    {
         eee->relay_proven = now;
-        eee->relay_giveup = 0;
-    }
 
     if (from_supernode) {
         ++(eee->rx_sup);
@@ -4940,21 +4977,48 @@ process_n2n_packet:
              * address; the normal non-punch handling below also keeps R as a
              * known peer (no direct punch) so we can register to it for relay. */
             if (pi.aflags & N2N_AFLAGS_RELAY) {
-                /* Log only when the relay actually changes (first assign,
-                 * or SN picked a new R). Repeating 15s re-advertisements of
-                 * the same relay are kept silent to avoid log spam. */
-                int relay_changed = ( !eee->relay_valid ||
-                                      eee->relay_sock.port != pi.sockets[0].port ||
-                                      memcmp(eee->relay_sock.addr.v4, pi.sockets[0].addr.v4,
-                                             IPV4_SIZE ) != 0 );
                 memcpy(eee->relay_mac, pi.mac, N2N_MAC_SIZE);
                 eee->relay_sock = pi.sockets[0];
                 eee->relay_valid = 1;
                 eee->relay_last_reg = 0; /* register to R on next tick */
-                if (relay_changed)
-                    traceEvent(TRACE_NORMAL, "Rx PEER_INFO RELAY relay=%s at %s",
-                               macaddr_str(mac_buf1, pi.mac),
-                               sock_to_cstr(sockbuf1, &pi.sockets[0]));
+                traceEvent(TRACE_INFO, "Rx PEER_INFO RELAY relay=%s at %s",
+                           macaddr_str(mac_buf1, pi.mac),
+                           sock_to_cstr(sockbuf1, &pi.sockets[0]));
+            }
+
+            /* R-RELAY (NAT2 support): the SN tells relay R that <mac> is about
+             * to register to it. Remember the member and immediately send a
+             * REGISTER toward its public socket: this pre-opens R's
+             * addr-restricted NAT so the member's REGISTER gets through. */
+            if ((pi.aflags & N2N_AFLAGS_RELAY_MEMBER) && eee->relay_mode) {
+                n2n_sock_t *msock = NULL;
+                if (pi.sockets[0].family == AF_INET)
+                    msock = &pi.sockets[0];
+                else if (pi.sock6.family == AF_INET6)
+                    msock = &pi.sock6;
+                if (msock && msock->port != 0) {
+                    struct peer_info *rp = NULL;
+                    PEERS_LOCK(eee);
+                    rp = find_peer_by_mac(eee->relay_expected, pi.mac);
+                    if (!rp) {
+                        rp = calloc(1, sizeof(struct peer_info));
+                        if (rp) {
+                            memcpy(rp->mac_addr, pi.mac, N2N_MAC_SIZE);
+                            rp->next = eee->relay_expected;
+                            eee->relay_expected = rp;
+                        }
+                    }
+                    if (rp) {
+                        if (msock->family == AF_INET) rp->sock = *msock;
+                        else rp->sock6 = *msock;
+                        rp->last_seen = n2n_now();
+                        send_register(eee, msock);
+                        traceEvent(TRACE_INFO, "relay: expect member %s at %s",
+                                   macaddr_str(mac_buf1, pi.mac),
+                                   sock_to_cstr(sockbuf1, msock));
+                    }
+                    PEERS_UNLOCK(eee);
+                }
             }
 
             if (pi.assigned_ip) {

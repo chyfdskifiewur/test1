@@ -253,11 +253,13 @@ typedef char macstr_t[N2N_MACSTR_SIZE];
                                  ((a) & N2N_AFLAGS_NAT_SYMMETRIC) ? N2N_NAT_SYMMETRIC : N2N_NAT_UNKNOWN )
 
 /* NAT types eligible to act as the community relay R (mini-SN).
- * A probe-eligible NAT1 is reported full-cone; otherwise a NAT1 that only
- * bounced through known IPs is reported restricted(NAT2) even though it is
- * fully reachable. Since R must be reachable from A/B for their REGISTER to
- * arrive, accept both -- a NAT2-labeled peer that A/B can actually reach
- * relays fine, and any relay failure falls back to SN anyway. */
+ * NAT1 (full-cone) and NAT2 (addr-restr). Both keep one mapping per local
+ * socket, so the socket the SN sees is the socket members reach. A NAT2 R
+ * additionally needs to pre-open its NAT toward each member: the SN hints
+ * the members (PEER_INFO RELAY_MEMBER) and R sends them a REGISTER first,
+ * else its NAT drops the members' REGISTERs. Port-restr is left out: it
+ * only lets exact ip:port replies in, and a member's port toward R is not
+ * known beforehand, so the pre-open would usually miss. */
 #define N2N_NAT_RELAY_CAPABLE(t) ( (t) == N2N_NAT_FULL_CONE || (t) == N2N_NAT_RESTRICTED )
 
 struct peer_info {
@@ -540,17 +542,26 @@ struct n2n_edge
 
     /* R-RELAY server: when set, this edge acts as R and forwards PACKETs
      * addressed to a peer that registered to it (mini-SN). Only a "good" peer
-     * (NAT1 + public address) self-enables this. NAT2 R is left for the
-     * "else -> back to SN" fallback and is not implemented. */
+     * (NAT1/NAT2 + public address) self-enables this; others fall back to
+     * plain SN relay. */
     uint8_t             relay_mode;
 
     /* R-RELAY server member table (mini-SN). Unlike known_peers/pending_peers
      * (the P2P tables this edge punches on), R keeps a dedicated list of peers
-     * that registered to it for forwarding; these are reachable directly
-     * (NAT1) so their socket comes from the actual REGISTER transport source.
+     * that registered to it for forwarding; their socket comes from the actual
+     * REGISTER transport source (once R's NAT lets it in).
      * This mirrors how the SN maintains its edge list, and is independent of
      * P2P cleanup so the relay path survives peer-table churn. */
     struct peer_info *  relay_peers;
+
+    /* R-RELAY server (NAT2 support): members the SN announced as relay users
+     * (PEER_INFO RELAY_MEMBER). An addr-restricted R must send the first
+     * packet toward each member or its NAT drops the members' REGISTERs; R
+     * re-sends a REGISTER on the relay_punch sweep to keep the path open
+     * across idle periods. Entries refresh with each SN hint and expire when
+     * the hints stop. */
+    struct peer_info *  relay_expected;
+    time_t              relay_punch_last;  /* last NAT pre-open sweep */
 
     /* Relay client state: relay_proven is refreshed by any frame received
      * THROUGH the relay; the RELAY_PROVEN_SECS window in check_relay then
