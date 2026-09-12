@@ -2084,16 +2084,16 @@ static void check_relay( n2n_edge_t * eee, time_t now )
     {
         struct peer_info *scan;
         PEERS_LOCK(eee);
-        /* The relay is dropped only once a *data* peer (never the relay peer
-         * itself) has a direct P2P link. The relay is itself a direct-reachable
-         * peer (NAT1/2) -- being able to reach it directly is the relay path
-         * itself, so a peer that matches the relay (by MAC) or that points at
-         * the relay's forwarding endpoint (socket alias) is excluded: it must
-         * never look like "direct connectivity". */
+        /* Only leave relay when ALL non-relay known peers have a direct path.
+         * Under mixed topology (some peers reachable, others still need the relay)
+         * the old "any single direct peer" heuristic triggered premature leave,
+         * causing the relay to flap on/off repeatedly. scan becomes NULL only
+         * when no non-relay peer is found with direct_seen == 0, meaning every
+         * data peer we need to talk to has already established a direct link. */
         for (scan = eee->known_peers; scan; scan = scan->next)
-            if (scan->direct_seen != 0 && !peer_is_the_relay( eee, scan )) break;
+            if (scan->direct_seen == 0 && !peer_is_the_relay( eee, scan )) break;
         PEERS_UNLOCK(eee);
-        if (scan) { /* some P2P data path is up -> no more relaying needed */
+        if (!scan) { /* all non-relay known peers are direct -> no more relaying needed */
             eee->relay_valid = 0;
             eee->relay_proven = 0;
             traceEvent( TRACE_NORMAL, "P2P direct up - leaving relay" );
