@@ -1702,7 +1702,11 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
             scan->punch_failed = 1;
             scan->punch_reset_time = now;
             if (memcmp(scan->mac_addr, eee->last_psp_log_mac, N2N_MAC_SIZE)) {
-                traceEvent(TRACE_NORMAL, "PsP (supernode relay) for %s",
+                /* This peer failed hole-punching so it can't go direct; it is
+                 * relayed via the community edge relay, not the supernode —
+                 * unless the relay is unavailable, in which case the send path
+                 * falls back to the supernode transparently. */
+                traceEvent(TRACE_NORMAL, "PsP (edge relay) for %s",
                            PEER_ID(mac_tmp, scan));
                 memcpy(eee->last_psp_log_mac, scan->mac_addr, N2N_MAC_SIZE);
             }
@@ -1996,10 +2000,11 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
     }
 }
 
-/* R-RELAY client lifecycle: while a community relay R is advertised, keep our
- * socket fresh at R by re-registering to it periodically. As soon as any direct
- * P2P link is established the relay is no longer needed, so we stop servicing R
- * and let its own copy age out (R-RELAY design: "direct success -> leave R"). */
+/* Relay-client lifecycle: while a community relay peer is advertised, keep our
+ * socket fresh at the relay by re-registering to it periodically. As soon as a
+ * direct P2P link to some other data peer is established the relay is no longer
+ * needed, so we stop servicing it and let the relay's own copy age out
+ * (design: "direct success -> leave the relay"). */
 
 /* The edge registers itself to the relay every 3s and the relay answers with
  * REGISTER_ACK. This heartbeat is traffic-independent: if we stop hearing the
@@ -2031,10 +2036,27 @@ static const char * relay_virt_ip_str( n2n_edge_t * eee, char * buf, size_t n )
     return buf;
 }
 
+/* True if <p> is the community relay peer itself or an alias of it: same MAC,
+ * or a peer whose known socket is exactly the relay's forwarding endpoint. The
+ * relay was chosen exactly because it is directly reachable (NAT1/2), so a
+ * "direct P2P link" to it is just the relay path itself and must NEVER be
+ * taken as proof of group-wide direct connectivity. Only a genuine direct link
+ * to some other data peer may disarm the relay. */
+static int peer_is_the_relay( const n2n_edge_t * eee, const struct peer_info * p )
+{
+    if ( memcmp( p->mac_addr, eee->relay_mac, N2N_MAC_SIZE ) == 0 ) return 1;
+    if ( eee->relay_sock.family != 0 )
+    {
+        if ( p->sock.family  != 0 && sock_equal( &p->sock,  &eee->relay_sock ) == 0 ) return 1;
+        if ( p->sock6.family != 0 && sock_equal( &p->sock6, &eee->relay_sock ) == 0 ) return 1;
+    }
+    return 0;
+}
+
 static void check_relay( n2n_edge_t * eee, time_t now )
 {
-    /* R-RELAY server: age out stale members from the dedicated table, mirroring
-     * how the SN expires its edge list. AB refresh their REGISTER every 3s, so
+    /* Relay server side: age out stale members from the dedicated table, mirroring
+     * how the SN expires its edge list. Clients refresh their REGISTER every 3s, so
      * a member silent for 60s is assumed gone. Independent of the client side. */
     if ( eee->relay_mode )
     {
@@ -2062,35 +2084,37 @@ static void check_relay( n2n_edge_t * eee, time_t now )
     {
         struct peer_info *scan;
         PEERS_LOCK(eee);
-        /* A/B are done with R only once a *data* peer (never R itself) has a
-         * direct P2P link. R is itself a direct-reachable peer (NAT1), so we
-         * must exclude relay_mac or R would disarm the relay immediately. */
+        /* The relay is dropped only once a *data* peer (never the relay peer
+         * itself) has a direct P2P link. The relay is itself a direct-reachable
+         * peer (NAT1/2) -- being able to reach it directly is the relay path
+         * itself, so a peer that matches the relay (by MAC) or that points at
+         * the relay's forwarding endpoint (socket alias) is excluded: it must
+         * never look like "direct connectivity". */
         for (scan = eee->known_peers; scan; scan = scan->next)
-            if (scan->direct_seen != 0 &&
-                memcmp(scan->mac_addr, eee->relay_mac, N2N_MAC_SIZE) != 0) break;
+            if (scan->direct_seen != 0 && !peer_is_the_relay( eee, scan )) break;
         PEERS_UNLOCK(eee);
         if (scan) { /* some P2P data path is up -> no more relaying needed */
             eee->relay_valid = 0;
             eee->relay_proven = 0;
-            traceEvent( TRACE_NORMAL, "relay: P2P direct up - leaving relay" );
+            traceEvent( TRACE_NORMAL, "P2P direct up - leaving relay" );
             return;
         }
     }
 
-    /* R failure detection (mirror of supernode failover): R answers our
-     * REGISTER every 3s with a REGISTER_ACK which refreshes relay_last_ack.
-     * If no ACK has been heard for RELAY_ACK_SECS, R is dead (process down,
-     * link lost, NAT rebound) -> fall back to the supernode and stop using R.
-     * Data traffic is deliberately NOT consulted: idle and one-way flows must
-     * never look like a dead relay. The 35s re-probe below gives R a chance
-     * to come back. */
+    /* Relay-liveness detection (mirror of supernode failover): the relay answers
+     * our REGISTER every 3s with a REGISTER_ACK which refreshes relay_last_ack.
+     * If no ACK has been heard for RELAY_ACK_SECS, the relay is dead (process
+     * down, link lost, NAT rebound) -> fall back to the supernode and stop using
+     * it. Data traffic is deliberately NOT consulted: idle and one-way flows
+     * must never look like a dead relay. The 35s re-probe below gives the relay
+     * a chance to come back. */
     if ( eee->relay_last_ack > 0 &&
          (now - eee->relay_last_ack) > RELAY_ACK_SECS )
     {
         eee->relay_giveup  = 1;
         eee->relay_probe_next = now + 35;
         {
-            traceEvent( TRACE_NORMAL, "relay: relay unresponsive - falling back to SN" );
+            traceEvent( TRACE_NORMAL, "Relay unresponsive - falling back to SN" );
         }
     }
     /* periodic retry: give R another chance after it was marked dead. */
@@ -2100,14 +2124,14 @@ static void check_relay( n2n_edge_t * eee, time_t now )
         eee->relay_probe_next = now + 35;
         {
             char vip[16];
-            traceEvent( TRACE_NORMAL, "relay: retrying relay %s",
+            traceEvent( TRACE_NORMAL, "Retrying relay %s",
                         relay_virt_ip_str( eee, vip, sizeof vip ) );
         }
     }
 
-    /* Keep R's copy of our socket alive (also registers us to R initially).
-     * No heartbeat log here — R state transitions are logged once at the
-     * switch points (enable / prove / fallback / retry), not every 3s. */
+    /* Keep the relay's copy of our socket alive (also registers us to it
+     * initially). No heartbeat log here — relay state transitions are logged
+     * once at the switch points (enable / prove / fallback / retry), not every 3s. */
     if ( eee->relay_sock.family != 0 && (now - eee->relay_last_reg) >= 3 )
     {
         eee->relay_last_reg = now;
@@ -2725,8 +2749,9 @@ static void nat_classify( n2n_edge_t * eee )
     traceEvent( TRACE_NORMAL, "NAT type: %s -> %s", old, new );
 
     /* Push the freshly classified NAT type to the SN right away so its
-     * relay-eligibility decision (谁有资格做组内中转) never lags the edge's
-     * real, up-to-date type. send_register_super carries the type in aflags.
+     * relay-eligibility decision (who is qualified to relay for the group)
+     * never lags the edge's real, up-to-date type. send_register_super
+     * carries the type in aflags.
      * The edge never judges eligibility itself: NAT being NAT1/2 already
      * implies a public address, and acting as relay is decided solely by the
      * SN (which designates us via PEER_INFO RELAY for our own MAC). */
@@ -3557,10 +3582,10 @@ static int handle_PACKET( n2n_edge_t * eee,
 
     from_supernode= cmn->flags & N2N_FLAGS_FROM_SUPERNODE;
 
-    /* R-RELAY: acting as community relay R (mini-SN). If this PACKET is aimed
-     * at a member that registered to us (not at ourselves), relay the already
-     * encrypted payload to that member unchanged — R never decrypts, so the
-     * e2e community transform is preserved. */
+    /* Relay mode: acting as the community relay peer (mini-SN). If this PACKET
+     * is aimed at a member that registered to us (not at ourselves), relay the
+     * already encrypted payload to that member unchanged — the relay never
+     * decrypts, so the e2e community transform is preserved. */
     if ( eee->relay_mode &&
          !is_multi_broadcast(pkt->dstMac) &&
          memcmp(pkt->dstMac, eee->device.mac_addr, N2N_MAC_SIZE) != 0 )
@@ -3606,13 +3631,14 @@ static int handle_PACKET( n2n_edge_t * eee,
         return retval;
     }
 
-    /* R-RELAY: a PACKET whose transport source is relay R is a *relayed* frame
-     * (R forwards the payload untouched; the header's embedded sock is the
-     * original sender, so only the transport source identifies R). Classify it
-     * like a supernode-relayed frame below so we never mis-mark the data peer
-     * as directly connected (which would disarm the relay / black-hole
-     * traffic). A frame reaching us through R also proves the relay path end
-     * to end — the sender may then drop the supernode copy. */
+    /* Relay: a PACKET whose transport source is the relay peer is a *relayed*
+     * frame (the relay forwards the payload untouched; the header's embedded
+     * sock is the original sender, so only the transport source identifies the
+     * relay). Classify it like a supernode-relayed frame below so we never
+     * mis-mark the data peer as directly connected (which would disarm the
+     * relay / black-hole traffic). A frame reaching us through the relay also
+     * proves the relay path end to end — the sender may then drop the
+     * supernode copy. */
     uint8_t from_relay = ( eee->relay_valid && tx_sender &&
                         sock_equal( &eee->relay_sock, tx_sender ) == 0 ) ? 1 : 0;
     if (from_relay && eee->relay_proven == 0)
@@ -3621,7 +3647,7 @@ static int handle_PACKET( n2n_edge_t * eee,
         const char * where = relay_virt_ip_str( eee, vip, sizeof vip );
         if ( vip[0] == '-' ) where = sock_to_cstr( relbuf, &eee->relay_sock );
         eee->relay_proven = now;
-        traceEvent( TRACE_NORMAL, "relay: relay path proven via %s", where );
+        traceEvent( TRACE_NORMAL, "Relay path proven via %s", where );
     }
     else if (from_relay)
         eee->relay_proven = now;
@@ -4756,10 +4782,11 @@ process_n2n_packet:
                  0 == memcmp(reg.dstMac, "\x00\x00\x00\x00\x00\x00", 6) )
             {
                 PEERS_LOCK(eee);
-                /* R-RELAY (mini-SN): when this edge acts as relay R, remember
-                 * the registrant in a dedicated member table for forwarding,
-                 * independent of the P2P peer tables. The registrant reaches R
-                 * directly (NAT1), so use the REGISTER transport source. */
+                /* Relay mode (mini-SN): when this edge acts as the community
+                 * relay, remember the registrant in a dedicated member table
+                 * for forwarding, independent of the P2P peer tables. The
+                 * registrant reaches the relay directly (NAT1), so use the
+                 * REGISTER transport source. */
                 if (eee->relay_mode && sender.family != 0) {
                     struct peer_info *rp = find_peer_by_mac(eee->relay_peers, reg.srcMac);
                     if (!rp) {
@@ -4969,12 +4996,12 @@ process_n2n_packet:
 
             int do_punch = (pi.aflags & N2N_AFLAGS_PUNCH_REQUEST) != 0;
 
-            /* R-RELAY: SN advertises the community relay. When the advertised
+            /* Relay: SN advertises the community relay peer. When the advertised
              * MAC is our own, the SN is designating THIS edge as the relay:
-             * switch on forwarding. Otherwise R is someone else and we remember
-             * its address so we can register to it as a client. The edge carries
-             * no eligibility judgment of its own -- the SN decides who qualifies
-             * (NAT1/2, public, willing). */
+             * switch on forwarding. Otherwise the relay is another peer and we
+             * remember its address so we can register to it as a client. The
+             * edge carries no eligibility judgment of its own -- the SN decides
+             * who qualifies (NAT1/2, public, willing). */
             if (pi.aflags & N2N_AFLAGS_RELAY) {
                 if (memcmp(pi.mac, eee->device.mac_addr, N2N_MAC_SIZE) == 0) {
                     eee->relay_mode = 1; /* we are the designated relay */
@@ -4989,7 +5016,7 @@ process_n2n_packet:
                     memcpy(eee->relay_mac, pi.mac, N2N_MAC_SIZE);
                     eee->relay_sock = pi.sockets[0];
                     eee->relay_valid = 1;
-                    eee->relay_last_reg = 0; /* register to R on next tick */
+                    eee->relay_last_reg = 0; /* register to the relay on next tick */
                     if (rchanged) {
                         /* Start the 15s grace: until the first REGISTER_ACK
                          * arrives, base relay_last_ack on now so a dead relay
