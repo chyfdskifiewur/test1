@@ -176,9 +176,9 @@ typedef struct n2n_PACKET n2n_PACKET_t;
 #define N2N_AFLAGS_NAT_RESTRICTED 0x0200  /* edge reports address-restricted cone NAT */
 #define N2N_AFLAGS_NAT_PORT_RESTRICT 0x0400 /* edge reports port-restricted NAT */
 #define N2N_AFLAGS_FORCE_PEER_INFO 0x0008  /* force supernode to push all peer info */
-#define N2N_AFLAGS_RELAY_WILLING_NO  0x0800 /* edge is unwilling to act as the community relay (SN won't pick it) */
-#define N2N_AFLAGS_RELAY_WILLING_YES 0x1000 /* edge is willing to act as the community relay (SN prefers it) */
-                                    /* neither set = default "can be" relay (secondary) */
+#define N2N_AFLAGS_RELAY_WILLING_NO  0x0800 /* edge is unwilling to act as relay R (SN picks it last) */
+#define N2N_AFLAGS_RELAY_WILLING_YES 0x1000 /* edge is willing to act as relay R (SN prefers it) */
+                                        /* neither set = default "can be" relay (secondary) */
 #define N2N_AFLAGS_QUERY_ONLY     0x0010  /* REGISTER_SUPER is a one-shot query
                                              (e.g. ask sn2 for sn1's current address):
                                              supernode replies with an ACK but does
@@ -435,12 +435,8 @@ size_t decode_PACKET( n2n_PACKET_t * pkt,
 #define N2N_AFLAGS_IPV6_SOCKET     0x0002  /* sock6 field is valid */
 #define N2N_AFLAGS_PUNCH_REQUEST   0x0004  /* QUERY_PEER triggered, edge should start punching */
 #define N2N_AFLAGS_SAME_LAN_AS_SN  0x0008  /* peer is in same LAN as supernode, replace IP with SN's public IP */
-#define N2N_AFLAGS_RELAY           0x0010  /* this peer is the community's relay server (mini-SN):
-                                              the two endpoints must register to it and use it
-                                              when their direct path fails */
-#define N2N_AFLAGS_RELAY_MEMBER    0x0020  /* sent to the relay server only: this peer will register
-                                              to the relay. A NAT2 relay pre-opens its NAT by sending
-                                              a REGISTER toward this peer's socket first */
+#define N2N_AFLAGS_RELAY           0x0010  /* this peer is the community's relay R (mini-SN):
+                                              A/B must register to it and use it when direct fails */
 typedef struct n2n_PEER_INFO {
     uint16_t   aflags;       /* N2N_AFLAGS_LOCAL_SOCKET if sockets[1] valid, N2N_AFLAGS_IPV6_SOCKET if sock6 valid, N2N_AFLAGS_PUNCH_REQUEST if should punch, N2N_AFLAGS_SAME_LAN_AS_SN if same LAN as SN */
     n2n_mac_t  mac;

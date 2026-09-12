@@ -710,7 +710,7 @@ struct n2n_sn
     n2n_trans_op_t      transop[N2N_MAX_TRANSFORMS];
     int                 ipv4_available; /* 0=unavailable, 1=available */
     int                 ipv6_available; /* 0=unavailable, 1=available */
-    int                 relay_advert_enabled; /* 1=advertise community relay (default), 0=off */
+    int                 relay_advert_enabled; /* 1=advertise community relay R (default), 0=off */
     /* Traffic stats and rate limiting */
     int                    traffic_stats_enabled;
     char                   stats_config_path[256];
@@ -2492,20 +2492,17 @@ static void push_nat_to_community( n2n_sn_t *sss,
                macaddr_str(mac_buf, changed->mac_addr));
 }
 
-/* ============ community relay server helpers (mini-SN) ================
+/* R-RELAY: ---- group relay R helpers (mini-SN) ----------------------------
  *
- * The relay is a community peer picked to relay traffic for members that cannot
- * P2P directly. The relay must be a "good" peer: cone NAT (NAT1 full-cone or
- * NAT2 addr-restr — both keep one mapping per socket, so the socket the SN sees
- * is the socket members reach) and a usable public IPv4 socket. A NAT2 relay
- * cannot be reached first, so the SN also hints the relay about the two peers
- * and the relay pre-opens its NAT by sending them a REGISTER
- * (send_relay_member_hint).
+ * R is a community peer picked to relay traffic for members that cannot
+ * P2P directly. R must be a "good" peer: measured cone NAT (NAT1) and holding
+ * a usable public IPv4 socket, so A/B can reach it without punching. Address
+ * rewriting / NAT2 R is intentionally left as the "else -> back to SN" path.
  * ------------------------------------------------------------------------ */
 
 /* A peer is relay-capable only if its extern addr is a public IPv4 and its
  * NAT type is relay-eligible (N2N_NAT_RELAY_CAPABLE). Private addrs would
- * make the two endpoints unreachable to it. */
+ * make A/B unreachable. */
 static int is_relay_capable( const struct peer_info * peer )
 {
     if (!peer) return 0;
@@ -2514,33 +2511,34 @@ static int is_relay_capable( const struct peer_info * peer )
     return !is_private_ipv4(peer->sock.addr.v4);
 }
 
-/* Pick the community's relay among registered edges. Excludes a given MAC
- * (e.g. the registering party) so the relay never relays for itself. Among
- * relay-capable peers, priority follows the edges' declared willingness:
- * eager (2) first, default (1) next. `-Z 0` (willing==0) peers refuse to be a
- * relay and are never picked at all. Newest peer first (edges list is
- * latest-first). Returns NULL if none eligible. */
+/* Pick the community's relay R among registered edges. Excludes a given MAC
+ * (e.g. the registering party) so R never relays for itself. Among relay-capable
+ * peers, priority follows the edges' declared willingness: eager (2) first,
+ * default (1) next, unwilling (0) only as last resort. Newest peer first (edges
+ * list is latest-first). Returns NULL if none eligible. */
 static struct peer_info * find_community_relay( n2n_sn_t *sss,
                                                 const n2n_community_t community,
                                                 const n2n_mac_t exclude_mac )
 {
     struct peer_info * scan;
     struct peer_info * best_default = NULL; /* willing==1 */
+    struct peer_info * best_unwilling = NULL; /* willing==0 */
     for ( scan = sss->edges; scan; scan = scan->next )
     {
         if ( memcmp(scan->mac_addr, exclude_mac, N2N_MAC_SIZE) == 0 ) continue;
         if ( memcmp(scan->community_name, community, sizeof(n2n_community_t)) != 0 ) continue;
-        if ( scan->relay_willing == 0 ) continue; /* -Z 0: explicitly refuses to be R */
         if ( !is_relay_capable(scan) ) continue;
         if ( scan->relay_willing == 2 ) return scan;       /* eager: prefer immediately */
-        if ( !best_default ) best_default = scan;          /* default (1) next */
+        else if ( scan->relay_willing == 1 ) { if (!best_default) best_default = scan; }
+        else                                              { if (!best_unwilling) best_unwilling = scan; }
     }
-    return best_default;
+    if ( best_default ) return best_default;
+    return best_unwilling;
 }
 
-/* Send one PEER_INFO telling <dest> that <relay> is the community relay.
- * The RELAY flag makes the receiving edge register to the relay and fall back to
- * it when direct punching fails. */
+/* Send one PEER_INFO telling <dest> that <relay> is the community relay R.
+ * The RELAY flag makes the receiving edge register to R and fall back to it
+ * when direct punching fails. */
 static void advertise_relay_to( n2n_sn_t *sss,
                                 const n2n_common_t * cmn,
                                 struct peer_info * dest,
@@ -2561,7 +2559,7 @@ static void advertise_relay_to( n2n_sn_t *sss,
     memcpy(pi_cmn.community, cmn->community, sizeof(n2n_community_t));
 
     memcpy(pi.mac, relay->mac_addr, N2N_MAC_SIZE);
-    pi.aflags = N2N_AFLAGS_RELAY; /* this peer is the relay, not a punch target */
+    pi.aflags = N2N_AFLAGS_RELAY; /* this peer is relay R, not a punch target */
     if (relay->sock.family == AF_INET)
         pi.sockets[0] = relay->sock;
     else if (relay->sock6.family == AF_INET6)
@@ -2578,55 +2576,9 @@ static void advertise_relay_to( n2n_sn_t *sss,
     sn_send_to_peer( sss, dest, pibuf, pix );
 }
 
-/* NAT2 relay support: tell the relay that <member> is about to register to it,
- * so the relay can pre-open its addr-restricted NAT by sending a REGISTER toward
- * the member's public socket. Without it the member's REGISTER would be dropped
- * by the relay's NAT and relaying could never start. Only public addresses are
- * punchable from the relay; private-sock members (same LAN as sn) get no hint. */
-static void send_relay_member_hint( n2n_sn_t *sss,
-                                    const n2n_common_t * cmn,
-                                    struct peer_info * relay,
-                                    struct peer_info * member )
-{
-    n2n_common_t    pi_cmn;
-    n2n_PEER_INFO_t pi;
-    uint8_t         pibuf[N2N_SN_PKTBUF_SIZE];
-    size_t          pix = 0;
-    int             have_v4 = 0;
-
-    if ( !relay || !member ) return;
-
-    have_v4 = ( member->sock.family == AF_INET &&
-                !is_private_ipv4(member->sock.addr.v4) );
-    if ( !have_v4 && member->sock6.family != AF_INET6 )
-        return; /* nothing punchable */
-
-    memset(&pi_cmn, 0, sizeof(pi_cmn));
-    memset(&pi, 0, sizeof(pi));
-    pi_cmn.ttl   = N2N_DEFAULT_TTL;
-    pi_cmn.pc    = n2n_peer_info;
-    pi_cmn.flags = N2N_FLAGS_FROM_SUPERNODE;
-    memcpy(pi_cmn.community, cmn->community, sizeof(n2n_community_t));
-
-    memcpy(pi.mac, member->mac_addr, N2N_MAC_SIZE);
-    pi.aflags = N2N_AFLAGS_RELAY_MEMBER;
-    if ( have_v4 )
-        pi.sockets[0] = member->sock;
-    if ( member->sock6.family == AF_INET6 ) {
-        pi.aflags |= N2N_AFLAGS_IPV6_SOCKET;
-        pi.sock6 = member->sock6;
-        if ( !have_v4 )
-            pi.sockets[0] = member->sock6;
-    }
-    pi.aflags |= N2N_NAT_AFLAGS(member->nat_type);
-
-    encode_PEER_INFO( pibuf, &pix, &pi_cmn, &pi );
-    sn_send_to_peer( sss, relay, pibuf, pix );
-}
-
 /* When the supernode actually relays unicast traffic between <req_mac> and
  * <tgt_mac> ("communication attempt / failed direct"), advertise the community
- * relay to both so they start registering to it and route through it.
+ * relay R to both so they start registering to R and route through it.
  * Throttled to ~once per 15s per requester so heavy flows don't flood PEER_INFO. */
 static void advertise_relay_on_pair( n2n_sn_t *sss,
                                      const n2n_common_t * cmn,
@@ -2643,7 +2595,7 @@ static void advertise_relay_on_pair( n2n_sn_t *sss,
     time_t now = time(NULL);
     if ( (now - req->relay_adv_time) < 15 ) return; /* throttled */
 
-    /* The relay must be a proper third peer: neither the sender nor the target. */
+    /* R must be a proper third peer: neither the sender nor the target. */
     struct peer_info * relay = find_community_relay( sss, cmn->community, req_mac );
     if ( !relay || (memcmp(relay->mac_addr, tgt_mac, N2N_MAC_SIZE) == 0) )
         return; /* no good peer -> stay on plain SN relay */
@@ -2652,11 +2604,6 @@ static void advertise_relay_on_pair( n2n_sn_t *sss,
     struct peer_info * tgt = find_peer_by_mac( sss->edges, tgt_mac );
     advertise_relay_to( sss, cmn, req, relay );
     if ( tgt ) advertise_relay_to( sss, cmn, tgt, relay );
-
-    /* NAT2 relay cannot be reached first: hint the relay about both ends so it
-     * pre-opens its NAT toward them while they start registering. */
-    send_relay_member_hint( sss, cmn, relay, req );
-    if ( tgt ) send_relay_member_hint( sss, cmn, relay, tgt );
 }
 
 /** Examine a datagram and determine what to do with it.
@@ -2934,9 +2881,8 @@ static int process_udp( n2n_sn_t * sss,
 
         if ( unicast )
         {
-            /* relay backup: supernode relaying first sender->receiver data = signal to
-             * start registering to the community relay (concurrent with the
-             * on-going punch). */
+            /* R-RELAY: supernode relaying first A->B data = signal to start
+             * registering to relay R (concurrent with the on-going punch). */
             if ( sender_peer )
                 advertise_relay_on_pair( sss, &cmn, sender_peer->mac_addr, compact_dstMac );
             try_forward( sss, &cmn, compact_dstMac, rec_buf, encx );
@@ -3072,9 +3018,8 @@ static int process_udp( n2n_sn_t * sss,
         /* Common section to forward the final product. */
         if ( unicast )
         {
-            /* relay backup: the supernode relaying sender->receiver data = clear sign
-             * direct failed; push the community relay so the two endpoints can
-             * switch to it. */
+            /* R-RELAY: supernode relaying A->B data = clear sign direct failed;
+             * push community relay R so A/B can switch to it. */
             advertise_relay_on_pair( sss, &cmn, pkt.srcMac, pkt.dstMac );
             try_forward( sss, &cmn, pkt.dstMac, rec_buf, encx );
         }
@@ -3111,8 +3056,8 @@ static int process_udp( n2n_sn_t * sss,
 
         if ( unicast )
         {
-        /* relay backup: one peer wants another -> tell both about the community
-         * relay so they can register to it and use it once direct punching fails. */
+        /* R-RELAY: A wants B -> tell both about community relay R so they can
+         * register to it and use it once direct punching fails. */
         advertise_relay_on_pair( sss, &cmn, reg.srcMac, reg.dstMac );
 
         traceEvent( TRACE_DEBUG, "Rx REGISTER %s -> %s %s",
@@ -3820,7 +3765,7 @@ static const struct option long_options[] = {
   { "verbose",         no_argument,       NULL, 'v' },
   { "ipv4",            no_argument,       NULL, '4' },
   { "ipv6",            no_argument,       NULL, '6' },
-  { "relay",           required_argument, NULL, 'Z' },  /* 0=disable community relay, else support */
+  { "relay",           required_argument, NULL, 'Z' },  /* 0=disable community relay R, else support */
   { NULL,              0,                 NULL,  0  }
 };
 
@@ -3942,7 +3887,7 @@ int main( int argc, char * const argv[] )
             case 'v': /* verbose */
                 ++traceLevel;
                 break;
-            case 'Z': /* 0=disable community relay, 1=support (default) */
+            case 'Z': /* 0=disable community relay R, 1=support (default) */
                 sss.relay_advert_enabled = ( (!optarg) || atoi(optarg) != 0 ) ? 1 : 0;
                 if ( !sss.relay_advert_enabled )
                     traceEvent(TRACE_NORMAL, "Community relay advertisement disabled (-Z 0)" );
