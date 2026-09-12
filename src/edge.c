@@ -2084,31 +2084,20 @@ static void check_relay( n2n_edge_t * eee, time_t now )
     {
         struct peer_info *scan;
         PEERS_LOCK(eee);
-        /* Leave relay only when there really are data peers to talk to (never
-         * the relay itself) AND every one of them already has a confirmed
-         * direct link. An empty known_peers -- or a table holding only the
-         * relay -- means no direct data path is confirmed at all, so the relay
-         * must stay up no matter what. The old "all direct" check treated the
-         * empty set as trivially true, so the supernode's periodic relay re-
-         * advertisement (every ~15s) triggered a leave every cycle, flapping
-         * in the log even though nothing could reach the relay at all. */
-        {
-            int nonrelay = 0;
-            int need_relay = 0;
-            for (scan = eee->known_peers; scan; scan = scan->next)
-                if (!peer_is_the_relay( eee, scan ))
-                {
-                    nonrelay++;
-                    if (scan->direct_seen == 0) need_relay = 1;
-                }
-            PEERS_UNLOCK(eee);
-            if (nonrelay > 0 && !need_relay)
-            {
-                eee->relay_valid = 0;
-                eee->relay_proven = 0;
-                traceEvent( TRACE_NORMAL, "P2P direct up - leaving relay" );
-                return;
-            }
+        /* Only leave relay when ALL non-relay known peers have a direct path.
+         * Under mixed topology (some peers reachable, others still need the relay)
+         * the old "any single direct peer" heuristic triggered premature leave,
+         * causing the relay to flap on/off repeatedly. scan becomes NULL only
+         * when no non-relay peer is found with direct_seen == 0, meaning every
+         * data peer we need to talk to has already established a direct link. */
+        for (scan = eee->known_peers; scan; scan = scan->next)
+            if (scan->direct_seen == 0 && !peer_is_the_relay( eee, scan )) break;
+        PEERS_UNLOCK(eee);
+        if (!scan) { /* all non-relay known peers are direct -> no more relaying needed */
+            eee->relay_valid = 0;
+            eee->relay_proven = 0;
+            traceEvent( TRACE_NORMAL, "P2P direct up - leaving relay" );
+            return;
         }
     }
 
