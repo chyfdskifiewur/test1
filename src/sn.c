@@ -3790,7 +3790,7 @@ static void help(int argc, char * const argv[])
     fprintf( stderr, "-t <port>\tSet management UDP port to <port> (default: 5646).\n" );
 #endif
     fprintf( stderr, "-v        \tIncrease verbosity. Can be used multiple times.\n" );
-    fprintf( stderr, "-Z <0|1>  \tRelay support: 0 = disable, 1 = enable (default).\n" );
+    fprintf( stderr, "-Z <mode> \tRelay support: 0 = disable, 1 = enable (default).\n" );
     fprintf( stderr, "-h        \tThis help message.\n" );
     fprintf( stderr, "\n" );
 }

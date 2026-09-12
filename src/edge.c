@@ -838,7 +838,7 @@ static void help() {
     printf("-T <token>               | Supernode registration token (ASCII, max 32).\n");
     printf("-v                       | Make more verbose. Repeat as required.\n");
     printf("-w                       | WebSocket mode: relay via supernode over WS (TCP), disable P2P.\n");
-    printf("-Z <0|1|2|3>             | Relay stance: 0 = refuse, 1 = default, 2 = willing, 3 = force.\n");
+    printf("-Z <mode>                | Relay stance: 0 = refuse, 1 = default, 2 = willing, 3 = force.\n");
     printf("-h                       | Show this help message.\n");
 
     printf("\nEnvironment variables:\n");
@@ -3615,6 +3615,18 @@ static int handle_PACKET( n2n_edge_t * eee,
     }
     else if (from_relay)
         eee->relay_proven = now;
+
+    /* A frame routed through R proves the relay is alive. This must clear
+     * relay_giveup immediately: otherwise check_relay's silent-5s fallback keeps
+     * giveup stuck at 1 (we keep sending via SN while still receiving via R),
+     * and the 35s retry re-toggles it -- the "falling back <-> path proven"
+     * flapping in the log. Restore relay-only forwarding on any real relay
+     * frame. */
+    if (from_relay && eee->relay_giveup)
+    {
+        eee->relay_giveup = 0;
+        eee->relay_probe_next = now + 35;
+    }
 
     if (from_supernode) {
         ++(eee->rx_sup);
