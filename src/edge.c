@@ -838,7 +838,7 @@ static void help() {
     printf("-T <token>               | Supernode registration token (ASCII, max 32).\n");
     printf("-v                       | Make more verbose. Repeat as required.\n");
     printf("-w                       | WebSocket mode: relay via supernode over WS (TCP), disable P2P.\n");
-    printf("-Z <0|1|2>               | Relay willingness: 0 = unwilling, 1 = default, 2 = willing.\n");
+    printf("-Z <0|1|2|3>             | Relay stance: 0 = refuse, 1 = default, 2 = willing, 3 = force.\n");
     printf("-h                       | Show this help message.\n");
 
     printf("\nEnvironment variables:\n");
@@ -1425,13 +1425,16 @@ static void send_register_super( n2n_edge_t * eee,
         }
     }
 
-    /* Relay willingness advertised to SN for community-relay selection:
-     * 0=unwilling, 1=default (no bit sent), 2=willing preferred. Always sent,
-     * independent of the edge's own NAT type. */
+    /* Relay stance advertised to SN for community-relay selection:
+     * 0=refuse, 1=default (no bit sent), 2=willing preferred,
+     * 3=force (be the relay even if the sn turned relay off).
+     * Always sent, independent of the edge's own NAT type. */
     if ( eee->relay_willing == 0 )
         reg.aflags |= N2N_AFLAGS_RELAY_WILLING_NO;
     else if ( eee->relay_willing == 2 )
         reg.aflags |= N2N_AFLAGS_RELAY_WILLING_YES;
+    else if ( eee->relay_willing == 3 )
+        reg.aflags |= N2N_AFLAGS_RELAY_WILLING_FORCE;
 
     /* Ask for a NAT bounce test on every registration while the type is not
      * final yet; the sn replies from its helper socket before ACKing. */
@@ -2709,21 +2712,19 @@ static void nat_classify( n2n_edge_t * eee )
     new = N2N_NAT_NAME( new_type );
     eee->nat_type = new_type;
 
-    /* R-RELAY: a good peer (NAT1 / public address) self-enables acting as
-     * relay R when its NAT type is relay-eligible (N2N_NAT_RELAY_CAPABLE).
-     * Other NAT types intentionally keep the SN-relay fallback. */
-    {
-        uint32_t ip = (eee->my_public_sock.family == AF_INET)
-                    ? ((uint32_t)eee->my_public_sock.addr.v4[0] << 24) |
-                      ((uint32_t)eee->my_public_sock.addr.v4[1] << 16) |
-                      ((uint32_t)eee->my_public_sock.addr.v4[2] << 8) |
-                       (uint32_t)eee->my_public_sock.addr.v4[3] : 0;
-        int priv = ((ip >> 24) == 10) || ((ip & 0xFFF00000) == 0xAC100000) ||
-                   ((ip >> 16) == (192 << 8 | 168)) || (ip == 0);
-        eee->relay_mode = (N2N_NAT_RELAY_CAPABLE(eee->nat_type) && !priv) ? 1 : 0;
-    }
-
     traceEvent( TRACE_NORMAL, "NAT type: %s -> %s", old, new );
+
+    /* Push the freshly classified NAT type to the SN right away so its
+     * relay-eligibility decision (谁有资格做组内中转) never lags the edge's
+     * real, up-to-date type. send_register_super carries the type in aflags.
+     * The edge never judges eligibility itself: NAT being NAT1/2 already
+     * implies a public address, and acting as relay is decided solely by the
+     * SN (which designates us via PEER_INFO RELAY for our own MAC). */
+    if ( eee->supernode.family != 0 )
+        send_register_super( eee, &(eee->supernode), 1, 0, NULL );
+    if ( eee->sn_query.family != 0 &&
+         memcmp( &eee->sn_query, &eee->supernode, sizeof(eee->sn_query) ) != 0 )
+        send_register_super( eee, &(eee->sn_query), 1, 0, NULL );
 }
 
 /* Bounce reply from a sn's helper socket arrived. Only public sources
@@ -3054,7 +3055,7 @@ static const struct option long_options[] = {
   { "verbose",         no_argument,       NULL, 'v' },
   { "bypass",          optional_argument, NULL, 'b' },
   { "gaming",          no_argument,       NULL, 'G' },
-  { "relay-willing",   required_argument, NULL, 'Z' }, /* 0=unwilling,1=default,2=eager as relay R */
+  { "relay-willing",   required_argument, NULL, 'Z' }, /* 0=refuse,1=default,2=willing,3=force */
   { NULL,              0,                 NULL,  0  }
 };
 
@@ -4930,17 +4931,32 @@ process_n2n_packet:
 
             int do_punch = (pi.aflags & N2N_AFLAGS_PUNCH_REQUEST) != 0;
 
-            /* R-RELAY: SN advertises the community relay R. Remember its
-             * address; the normal non-punch handling below also keeps R as a
-             * known peer (no direct punch) so we can register to it for relay. */
+            /* R-RELAY: SN advertises the community relay. When the advertised
+             * MAC is our own, the SN is designating THIS edge as the relay:
+             * switch on forwarding. Otherwise R is someone else and we remember
+             * its address so we can register to it as a client. The edge carries
+             * no eligibility judgment of its own -- the SN decides who qualifies
+             * (NAT1/2, public, willing). */
             if (pi.aflags & N2N_AFLAGS_RELAY) {
-                memcpy(eee->relay_mac, pi.mac, N2N_MAC_SIZE);
-                eee->relay_sock = pi.sockets[0];
-                eee->relay_valid = 1;
-                eee->relay_last_reg = 0; /* register to R on next tick */
-                traceEvent(TRACE_INFO, "Rx PEER_INFO RELAY relay=%s at %s",
-                           macaddr_str(mac_buf1, pi.mac),
-                           sock_to_cstr(sockbuf1, &pi.sockets[0]));
+                if (memcmp(pi.mac, eee->device.mac_addr, N2N_MAC_SIZE) == 0) {
+                    eee->relay_mode = 1; /* we are the designated relay */
+                } else {
+                    /* Client view: remember R so we can register to it. Log only
+                     * when R actually changes -- SN re-advertises the same relay
+                     * every ~15s, and repeating it would spam the log. */
+                    int rchanged = ( !eee->relay_valid ||
+                                     eee->relay_sock.port != pi.sockets[0].port ||
+                                     memcmp(eee->relay_sock.addr.v4, pi.sockets[0].addr.v4,
+                                            IPV4_SIZE) != 0 );
+                    memcpy(eee->relay_mac, pi.mac, N2N_MAC_SIZE);
+                    eee->relay_sock = pi.sockets[0];
+                    eee->relay_valid = 1;
+                    eee->relay_last_reg = 0; /* register to R on next tick */
+                    if (rchanged)
+                        traceEvent(TRACE_INFO, "Rx PEER_INFO RELAY relay=%s at %s",
+                                   macaddr_str(mac_buf1, pi.mac),
+                                   sock_to_cstr(sockbuf1, &pi.sockets[0]));
+                }
             }
 
             if (pi.assigned_ip) {
@@ -6830,15 +6846,15 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
             eee.enable_gaming_mode = 1;
             break;
 
-        case 'Z': /* relay willingness: 0=unwilling, 1=default, 2=eager */
+        case 'Z': /* relay stance: 0=refuse, 1=default, 2=willing, 3=force */
             if (!optarg) {
-                fprintf(stderr, "Error: -Z requires a value of 0, 1 or 2\n");
+                fprintf(stderr, "Error: -Z requires a value of 0, 1, 2 or 3\n");
                 exit(1);
             }
             {
                 int w = atoi(optarg);
-                if (w < 0 || w > 2) {
-                    fprintf(stderr, "Error: invalid -Z value %s (use 0, 1 or 2)\n", optarg);
+                if (w < 0 || w > 3) {
+                    fprintf(stderr, "Error: invalid -Z value %s (use 0, 1, 2 or 3)\n", optarg);
                     exit(1);
                 }
                 eee.relay_willing = w;

@@ -252,11 +252,13 @@ typedef char macstr_t[N2N_MACSTR_SIZE];
                                  ((a) & N2N_AFLAGS_NAT_FULL_CONE) ? N2N_NAT_FULL_CONE : \
                                  ((a) & N2N_AFLAGS_NAT_SYMMETRIC) ? N2N_NAT_SYMMETRIC : N2N_NAT_UNKNOWN )
 
-/* NAT types eligible to act as the community relay R (mini-SN).
- * Phase 1: NAT1 only (N2N_NAT_FULL_CONE). NAT2 (addr-restr) is reserved:
- * extend this single macro when implemented, else the edge falls back to
- * SN relay. */
-#define N2N_NAT_RELAY_CAPABLE(t) ( (t) == N2N_NAT_FULL_CONE )
+/* NAT types eligible to act as the community relay R (mini-SN):
+ * can the peer be reached without punching? Only a full-cone (NAT1) or a
+ * restricted-cone (NAT2) mapping -- any stricter kind (port-restricted,
+ * symmetric) falls back to the plain SN relay. This single macro is the
+ * SN's only relay-eligibility gate (谁是资格中转节点由 SN 统一判定). */
+#define N2N_NAT_RELAY_CAPABLE(t) ( (t) == N2N_NAT_FULL_CONE || \
+                                   (t) == N2N_NAT_RESTRICTED )
 
 struct peer_info {
     struct peer_info *  next;
@@ -294,7 +296,7 @@ struct peer_info {
     uint8_t             p2p_is_lan;        /* 1=LAN P2P, set by edge.c at REGISTER_SUPER_ACK */
     uint8_t             same_lan_as_sn;    /* 1 if edge is in same LAN as supernode */
     time_t              relay_adv_time;    /* sn: last time this edge was advertised relay R (throttle) */
-    uint8_t             relay_willing;     /* sn: edge's willingness to act as relay R: 0=no,1=default,2=yes */
+    uint8_t             relay_willing;     /* sn: edge's relay stance: 0=refuse,1=default,2=willing,3=force */
     /* Compact packet protocol support (version 0xE5 header) */
     uint8_t             compact_capable;   /* 1=understands compact format, 0=legacy/unknown */
     uint16_t            transform_id;      /* transform ID learned from PACKET headers (for SN legacy conversion) */
@@ -556,7 +558,7 @@ struct n2n_edge
      * relay_probe_next period. */
     time_t              relay_probe_next;       /* when to retry a dead relay */
     uint8_t             relay_giveup;           /* 1=relay deemed dead, stay on SN until retry */
-    uint8_t             relay_willing;          /* advertised to SN for relay selection: 0/1/2 */
+    uint8_t             relay_willing;          /* advertised to SN for relay selection: 0/1/2/3 */
 
     struct peer_info *  known_peers;
     struct peer_info *  pending_peers;

@@ -2512,28 +2512,59 @@ static int is_relay_capable( const struct peer_info * peer )
 }
 
 /* Pick the community's relay R among registered edges. Excludes a given MAC
- * (e.g. the registering party) so R never relays for itself. Among relay-capable
- * peers, priority follows the edges' declared willingness: eager (2) first,
- * default (1) next, unwilling (0) only as last resort. Newest peer first (edges
- * list is latest-first). Returns NULL if none eligible. */
+ * (e.g. the registering party) so R never relays for itself. A -Z 3 (force)
+ * member is always used as-is and never filtered by NAT/public state -- if it
+ * cannot relay, the edge's 5s relay_proven fallback routes back through the
+ * SN. When several forcing members exist, exactly one is chosen at random and
+ * given a single chance (no rotation) -- this is an edge case and is
+ * intentionally rough. Only when nobody forces does the normal priority
+ * apply: willing (2) over default (1); a refusing peer (-Z 0) is never picked,
+ * and when relay is globally off (force_only) nobody forces means no relay at
+ * all. Newest peer first (edges list is latest-first). Returns NULL if none
+ * eligible. */
 static struct peer_info * find_community_relay( n2n_sn_t *sss,
                                                 const n2n_community_t community,
-                                                const n2n_mac_t exclude_mac )
+                                                const n2n_mac_t exclude_mac,
+                                                int force_only )
 {
     struct peer_info * scan;
-    struct peer_info * best_default = NULL; /* willing==1 */
-    struct peer_info * best_unwilling = NULL; /* willing==0 */
+    struct peer_info * forcers[32];
+    int n = 0;
+
     for ( scan = sss->edges; scan; scan = scan->next )
     {
         if ( memcmp(scan->mac_addr, exclude_mac, N2N_MAC_SIZE) == 0 ) continue;
         if ( memcmp(scan->community_name, community, sizeof(n2n_community_t)) != 0 ) continue;
-        if ( !is_relay_capable(scan) ) continue;
-        if ( scan->relay_willing == 2 ) return scan;       /* eager: prefer immediately */
-        else if ( scan->relay_willing == 1 ) { if (!best_default) best_default = scan; }
-        else                                              { if (!best_unwilling) best_unwilling = scan; }
+        if ( scan->relay_willing == 3 )
+        {
+            if ( n < 32 ) forcers[n++] = scan; /* never state-checked */
+        }
     }
-    if ( best_default ) return best_default;
-    return best_unwilling;
+    if ( n > 0 )
+    {
+        /* Random single pick among the forcing members -- one chance. */
+        unsigned long seed = (unsigned long)time(NULL) ^ (unsigned long)&forcers[0];
+        seed = seed * 2654435761u;
+        seed += (unsigned long)&scan; /* vary with layout across calls */
+        return forcers[ seed % n ];
+    }
+
+    {
+        struct peer_info * best_willing = NULL;  /* willing==2 */
+        struct peer_info * best_default = NULL;  /* willing==1 */
+        for ( scan = sss->edges; scan; scan = scan->next )
+        {
+            if ( memcmp(scan->mac_addr, exclude_mac, N2N_MAC_SIZE) == 0 ) continue;
+            if ( memcmp(scan->community_name, community, sizeof(n2n_community_t)) != 0 ) continue;
+            if ( !is_relay_capable(scan) ) continue;
+            if ( scan->relay_willing == 0 ) continue;      /* refusing: never pick */
+            if ( force_only ) continue;                    /* globally off, nobody forces: no relay */
+            if ( scan->relay_willing == 2 ) { if (!best_willing) best_willing = scan; }
+            else if ( !best_default ) best_default = scan;
+        }
+        if ( best_willing ) return best_willing;
+        return best_default;
+    }
 }
 
 /* Send one PEER_INFO telling <dest> that <relay> is the community relay R.
@@ -2585,9 +2616,13 @@ static void advertise_relay_on_pair( n2n_sn_t *sss,
                                      const n2n_mac_t req_mac,
                                      const n2n_mac_t tgt_mac )
 {
+    int force_only;
     /* Whole-relay feature switch: when the admin disabled community relay
-     * advertisement, never pick/announce an R and stay on plain SN relay. */
-    if ( !sss->relay_advert_enabled ) return;
+     * advertisement (sn -Z 0), stay on plain SN relay UNLESS a member forces
+     * (edge -Z 3) -- a forcing member turns the group relay back on and is then
+     * used as-is (SN never checks its NAT/public state); if it cannot relay,
+     * the edge's 5s relay_proven fallback routes back through the SN. */
+    force_only = !sss->relay_advert_enabled;
 
     struct peer_info * req = find_peer_by_mac( sss->edges, req_mac );
     if ( !req ) return;
@@ -2596,14 +2631,17 @@ static void advertise_relay_on_pair( n2n_sn_t *sss,
     if ( (now - req->relay_adv_time) < 15 ) return; /* throttled */
 
     /* R must be a proper third peer: neither the sender nor the target. */
-    struct peer_info * relay = find_community_relay( sss, cmn->community, req_mac );
+    struct peer_info * relay = find_community_relay( sss, cmn->community, req_mac, force_only );
     if ( !relay || (memcmp(relay->mac_addr, tgt_mac, N2N_MAC_SIZE) == 0) )
-        return; /* no good peer -> stay on plain SN relay */
+        return; /* no good peer (incl. globally-off with no forcing member) -> plain SN */
     req->relay_adv_time = now;
 
     struct peer_info * tgt = find_peer_by_mac( sss->edges, tgt_mac );
     advertise_relay_to( sss, cmn, req, relay );
     if ( tgt ) advertise_relay_to( sss, cmn, tgt, relay );
+    /* Notify the relay itself (PEER_INFO RELAY naming its own MAC) so it
+     * switches on forwarding without self-judging eligibility. Idempotent. */
+    advertise_relay_to( sss, cmn, relay, relay );
 }
 
 /** Examine a datagram and determine what to do with it.
@@ -3603,14 +3641,17 @@ static int process_udp( n2n_sn_t * sss,
         if ( is_new_edge )
             send_fc_probe_request( sss, reg.edgeMac, &(ack.sock), now );
 
-        /* Remember the edge's relay willingness so find_community_relay can
-         * prefer eager / skip unwilling candidates. Default (neither bit)=1. */
+        /* Remember the edge's relay stance so find_community_relay can prefer
+         * willing/force / skip refusing candidates. Default (neither bit)=1;
+         * force (3) is the relay even if relay is globally off. */
         if (!query_only)
         {
             struct peer_info *w_edge = find_peer_by_mac( sss->edges, reg.edgeMac );
             if ( w_edge )
             {
-                if ( reg.aflags & N2N_AFLAGS_RELAY_WILLING_NO )
+                if ( reg.aflags & N2N_AFLAGS_RELAY_WILLING_FORCE )
+                    w_edge->relay_willing = 3;
+                else if ( reg.aflags & N2N_AFLAGS_RELAY_WILLING_NO )
                     w_edge->relay_willing = 0;
                 else if ( reg.aflags & N2N_AFLAGS_RELAY_WILLING_YES )
                     w_edge->relay_willing = 2;
