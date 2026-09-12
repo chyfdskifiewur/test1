@@ -536,7 +536,10 @@ struct n2n_edge
     n2n_sock_t          relay_sock;
     uint8_t             relay_valid;
     time_t              relay_last_reg;
-    time_t              relay_proven;   /* last time a frame was received THROUGH relay R; 0=never */
+    time_t              relay_proven;       /* last time a frame was received THROUGH the relay; 0=never */
+    time_t              relay_last_ack;     /* last time the relay answered our REGISTER (heartbeat ACK);
+                                               0 = never / not installed. Health signal, decoupled from
+                                               data traffic like the supernode failover logic */
 
     /* R-RELAY server: when set, this edge acts as R and forwards PACKETs
      * addressed to a peer that registered to it (mini-SN). Only a "good" peer
@@ -552,10 +555,11 @@ struct n2n_edge
      * P2P cleanup so the relay path survives peer-table churn. */
     struct peer_info *  relay_peers;
 
-    /* Relay client state: relay_proven is refreshed by any frame received
-     * THROUGH the relay; the RELAY_PROVEN_SECS window in check_relay then
-     * detects a dead relay and falls back to the supernode, retrying it every
-     * relay_probe_next period. */
+    /* Relay client state: relay_last_ack is refreshed by the relay's REGISTER_ACK
+     * (our 3s heartbeat) and drives liveness: no ACK for RELAY_ACK_SECS means
+     * the relay is dead and we fall back to the supernode, retrying it every
+     * relay_probe_next period. relay_proven tracks frames received THROUGH the
+     * relay and controls send-side single/dual sending. */
     time_t              relay_probe_next;       /* when to retry a dead relay */
     uint8_t             relay_giveup;           /* 1=relay deemed dead, stay on SN until retry */
     uint8_t             relay_willing;          /* advertised to SN for relay selection: 0/1/2/3 */

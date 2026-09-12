@@ -2001,10 +2001,19 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
  * P2P link is established the relay is no longer needed, so we stop servicing R
  * and let its own copy age out (R-RELAY design: "direct success -> leave R"). */
 
-/* How long a proven relay path stays "trusted" without further traffic through
-     * it. If no frame arrives via the relay for this long, the relay is assumed
-     * dead and the edge falls back to the supernode (and periodically retries). */
-#define RELAY_PROVEN_SECS   5
+/* The edge registers itself to the relay every 3s and the relay answers with
+ * REGISTER_ACK. This heartbeat is traffic-independent: if we stop hearing the
+ * relay's ACK for this long the relay is assumed dead and the edge falls back
+ * to the supernode (and periodically retries). Mirror of the supernode
+ * failover logic (REGISTER_SUPER / ACK), so it cannot false-trigger on idle
+ * or one-way flows. */
+#define RELAY_ACK_SECS   15
+
+/* How long a frame actually received THROUGH the relay keeps the relay path
+ * "proven" for send-side decisions: while proven we single-send via the relay,
+ * otherwise we dual-send relay+supernode. This is a data-path window only and
+ * is unrelated to liveness detection (RELAY_ACK_SECS). */
+#define RELAY_PROVEN_SECS  5
 
 /* Virtual IP of the current community relay (resolved from the relay peer's
  * assigned_ip, same source the management page uses), or "-" if unknown yet. */
@@ -2068,19 +2077,20 @@ static void check_relay( n2n_edge_t * eee, time_t now )
         }
     }
 
-    /* R failure detection: a proven R is only trusted while traffic keeps
-     * flowing through it. If nothing has come back via R for RELAY_PROVEN_SECS,
-     * R has likely died -> fall back to the supernode and stop dual-sending to
-     * it; schedule a periodic retry so we resume R once it returns. */
-    if ( eee->relay_proven > 0 &&
-         (now - eee->relay_proven) > RELAY_PROVEN_SECS )
+    /* R failure detection (mirror of supernode failover): R answers our
+     * REGISTER every 3s with a REGISTER_ACK which refreshes relay_last_ack.
+     * If no ACK has been heard for RELAY_ACK_SECS, R is dead (process down,
+     * link lost, NAT rebound) -> fall back to the supernode and stop using R.
+     * Data traffic is deliberately NOT consulted: idle and one-way flows must
+     * never look like a dead relay. The 35s re-probe below gives R a chance
+     * to come back. */
+    if ( eee->relay_last_ack > 0 &&
+         (now - eee->relay_last_ack) > RELAY_ACK_SECS )
     {
-        eee->relay_proven = 0;
         eee->relay_giveup  = 1;
         eee->relay_probe_next = now + 35;
         {
-            traceEvent( TRACE_NORMAL, "relay: relay silent %us - falling back to SN",
-                        RELAY_PROVEN_SECS );
+            traceEvent( TRACE_NORMAL, "relay: relay unresponsive - falling back to SN" );
         }
     }
     /* periodic retry: give R another chance after it was marked dead. */
@@ -3155,15 +3165,15 @@ static int send_PACKET( n2n_edge_t * eee,
          * target is not broadcastable, route via relay. While the relay path is
          * unproven (or recently silent) we dual-send relay+SN so no data is lost;
          * once a frame actually comes back through relay (relay_proven window) we
-         * use relay only. A dead relay (no frame via relay for RELAY_PROVEN_SECS)
-         * is handled in check_relay, which flags giveup and falls back to SN.
-         * Relay send failure here also falls back to SN. */
+         * use relay only. A dead relay is detected by the REGISTER_ACK heartbeat
+         * in check_relay (RELAY_ACK_SECS), which flags giveup and falls back to
+         * SN. Relay send failure here also falls back to SN. */
         int via_relay = (eee->relay_valid && !is_multi_broadcast(dstMac));
         if (via_relay && !eee->relay_giveup)
         {
             time_t rnow = n2n_now();
-            /* proven only while actively hearing from relay; a dead relay cannot
-             * permanently strand the flow thanks to the RELAY_PROVEN_SECS window. */
+            /* proven only while a frame recently came back through the relay;
+             * until then we dual-send so a slow start cannot strand the flow. */
             int proven = ( eee->relay_proven != 0 &&
                           (rnow - eee->relay_proven) <= RELAY_PROVEN_SECS );
             if (proven)
@@ -4846,6 +4856,22 @@ process_n2n_packet:
                        sock_to_cstr(sockbuf1, &sender),
                        sock_to_cstr(sockbuf2, orig_sender) );
 
+            /* Heartbeat: a REGISTER_ACK from the community relay (R) is the
+             * relay's liveness answer to our every-3s REGISTER. Refresh the
+             * health timestamp and clear any gave-up state so we resume R.
+             * Mirrors how REGISTER_SUPER_ACK keeps the active supernode alive;
+             * traffic is never consulted here. */
+            if ( eee->relay_valid &&
+                 memcmp( ra.srcMac, eee->relay_mac, N2N_MAC_SIZE) == 0 )
+            {
+                eee->relay_last_ack = n2n_now();
+                if ( eee->relay_giveup )
+                {
+                    eee->relay_giveup = 0;
+                    eee->relay_probe_next = n2n_now() + 35;
+                }
+            }
+
             /* Move from pending_peers to known_peers; ignore if not in pending. */
             PEERS_LOCK(eee);
             if ( from_supernode ) {
@@ -4964,10 +4990,17 @@ process_n2n_packet:
                     eee->relay_sock = pi.sockets[0];
                     eee->relay_valid = 1;
                     eee->relay_last_reg = 0; /* register to R on next tick */
-                    if (rchanged)
+                    if (rchanged) {
+                        /* Start the 15s grace: until the first REGISTER_ACK
+                         * arrives, base relay_last_ack on now so a dead relay
+                         * is detected after RELAY_ACK_SECS even if it never
+                         * ACKs at all. Re-advertisement of the same R leaves
+                         * the existing health timestamp untouched. */
+                        eee->relay_last_ack = n2n_now();
                         traceEvent(TRACE_INFO, "Rx PEER_INFO RELAY relay=%s at %s",
                                    macaddr_str(mac_buf1, pi.mac),
                                    sock_to_cstr(sockbuf1, &pi.sockets[0]));
+                    }
                 }
             }
 
